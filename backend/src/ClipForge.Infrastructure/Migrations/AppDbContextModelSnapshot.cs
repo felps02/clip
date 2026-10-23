@@ -407,6 +407,60 @@ namespace ClipForge.Infrastructure.Migrations
                     b.ToTable("clip_renders", (string)null);
                 });
 
+            modelBuilder.Entity("ClipForge.Domain.Entities.CompanionDevice", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<DateTimeOffset?>("LastSeenAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_seen_at");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(60)
+                        .HasColumnType("character varying(60)")
+                        .HasColumnName("name");
+
+                    b.Property<DateTimeOffset?>("RevokedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("token_hash");
+
+                    b.Property<string>("TokenPrefix")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("token_prefix");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("user_id");
+
+                    b.HasKey("Id")
+                        .HasName("pk_companion_devices");
+
+                    b.HasIndex("TokenHash")
+                        .IsUnique()
+                        .HasDatabaseName("ix_companion_devices_token_hash");
+
+                    b.HasIndex("UserId", "CreatedAt")
+                        .HasDatabaseName("ix_companion_devices_user_id_created_at");
+
+                    b.ToTable("companion_devices", (string)null);
+                });
+
             modelBuilder.Entity("ClipForge.Domain.Entities.IntegrationConnection", b =>
                 {
                     b.Property<Guid>("Id")
@@ -477,6 +531,183 @@ namespace ClipForge.Infrastructure.Migrations
                         .HasDatabaseName("ix_integration_connections_user_id_provider_external_account_id");
 
                     b.ToTable("integration_connections", (string)null);
+                });
+
+            modelBuilder.Entity("ClipForge.Domain.Entities.LiveSegment", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<decimal>("DurationSeconds")
+                        .HasPrecision(12, 3)
+                        .HasColumnType("numeric(12,3)")
+                        .HasColumnName("duration_seconds");
+
+                    b.Property<string>("Error")
+                        .HasMaxLength(2000)
+                        .HasColumnType("character varying(2000)")
+                        .HasColumnName("error");
+
+                    b.Property<bool>("IsFinal")
+                        .HasColumnType("boolean")
+                        .HasColumnName("is_final");
+
+                    b.Property<Guid?>("JobId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("job_id");
+
+                    b.Property<string>("LiveContext")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("live_context");
+
+                    b.Property<Guid?>("MediaAssetId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("media_asset_id");
+
+                    b.Property<int>("Sequence")
+                        .HasColumnType("integer")
+                        .HasColumnName("sequence");
+
+                    b.Property<Guid>("SessionId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("session_id");
+
+                    b.Property<decimal>("StartOffsetSeconds")
+                        .HasPrecision(12, 3)
+                        .HasColumnType("numeric(12,3)")
+                        .HasColumnName("start_offset_seconds");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("status");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("user_id");
+
+                    b.HasKey("Id")
+                        .HasName("pk_live_segments");
+
+                    b.HasIndex("JobId")
+                        .HasDatabaseName("ix_live_segments_job_id");
+
+                    b.HasIndex("MediaAssetId")
+                        .HasDatabaseName("ix_live_segments_media_asset_id");
+
+                    b.HasIndex("UserId")
+                        .HasDatabaseName("ix_live_segments_user_id");
+
+                    b.HasIndex("SessionId", "Sequence")
+                        .IsUnique()
+                        .HasDatabaseName("ix_live_segments_session_id_sequence");
+
+                    b.ToTable("live_segments", (string)null);
+                });
+
+            modelBuilder.Entity("ClipForge.Domain.Entities.LiveSession", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CompanionState")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("companion_state");
+
+                    b.Property<Guid>("DeviceId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("device_id");
+
+                    b.Property<string>("EndReason")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)")
+                        .HasColumnName("end_reason");
+
+                    b.Property<DateTimeOffset?>("EndedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("ended_at");
+
+                    b.Property<DateTimeOffset?>("LastHeartbeatAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_heartbeat_at");
+
+                    b.Property<DateTimeOffset?>("LastSegmentAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_segment_at");
+
+                    b.Property<string>("Obs")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("obs");
+
+                    b.Property<Guid>("ProjectId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("project_id");
+
+                    b.Property<int>("SegmentSeconds")
+                        .HasColumnType("integer")
+                        .HasColumnName("segment_seconds");
+
+                    b.Property<string>("Settings")
+                        .IsRequired()
+                        .HasColumnType("jsonb")
+                        .HasColumnName("settings");
+
+                    b.Property<DateTimeOffset>("StartedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("started_at");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("status");
+
+                    b.Property<bool>("StopRequested")
+                        .HasColumnType("boolean")
+                        .HasColumnName("stop_requested");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("user_id");
+
+                    b.HasKey("Id")
+                        .HasName("pk_live_sessions");
+
+                    b.HasIndex("DeviceId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_live_sessions_device_active")
+                        .HasFilter("status IN ('waiting', 'live', 'ending')");
+
+                    b.HasIndex("ProjectId")
+                        .IsUnique()
+                        .HasDatabaseName("ix_live_sessions_project_id");
+
+                    b.HasIndex("Status", "LastHeartbeatAt")
+                        .HasDatabaseName("ix_live_sessions_open")
+                        .HasFilter("status IN ('waiting', 'live', 'ending')");
+
+                    b.HasIndex("UserId", "StartedAt")
+                        .IsDescending(false, true)
+                        .HasDatabaseName("ix_live_sessions_user_id_started_at");
+
+                    b.ToTable("live_sessions", (string)null);
                 });
 
             modelBuilder.Entity("ClipForge.Domain.Entities.MediaAsset", b =>
@@ -1542,6 +1773,16 @@ namespace ClipForge.Infrastructure.Migrations
                     b.Navigation("Clip");
                 });
 
+            modelBuilder.Entity("ClipForge.Domain.Entities.CompanionDevice", b =>
+                {
+                    b.HasOne("ClipForge.Domain.Entities.AppUser", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_companion_devices_users_user_id");
+                });
+
             modelBuilder.Entity("ClipForge.Domain.Entities.IntegrationConnection", b =>
                 {
                     b.HasOne("ClipForge.Domain.Entities.AppUser", null)
@@ -1550,6 +1791,67 @@ namespace ClipForge.Infrastructure.Migrations
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired()
                         .HasConstraintName("fk_integration_connections_users_user_id");
+                });
+
+            modelBuilder.Entity("ClipForge.Domain.Entities.LiveSegment", b =>
+                {
+                    b.HasOne("ClipForge.Domain.Entities.ProcessingJob", null)
+                        .WithMany()
+                        .HasForeignKey("JobId")
+                        .OnDelete(DeleteBehavior.SetNull)
+                        .HasConstraintName("fk_live_segments_processing_jobs_job_id");
+
+                    b.HasOne("ClipForge.Domain.Entities.MediaAsset", "MediaAsset")
+                        .WithMany()
+                        .HasForeignKey("MediaAssetId")
+                        .OnDelete(DeleteBehavior.SetNull)
+                        .HasConstraintName("fk_live_segments_media_assets_media_asset_id");
+
+                    b.HasOne("ClipForge.Domain.Entities.LiveSession", "Session")
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_live_segments_live_sessions_session_id");
+
+                    b.HasOne("ClipForge.Domain.Entities.AppUser", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_live_segments_users_user_id");
+
+                    b.Navigation("MediaAsset");
+
+                    b.Navigation("Session");
+                });
+
+            modelBuilder.Entity("ClipForge.Domain.Entities.LiveSession", b =>
+                {
+                    b.HasOne("ClipForge.Domain.Entities.CompanionDevice", "Device")
+                        .WithMany()
+                        .HasForeignKey("DeviceId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_live_sessions_companion_devices_device_id");
+
+                    b.HasOne("ClipForge.Domain.Entities.Project", "Project")
+                        .WithMany()
+                        .HasForeignKey("ProjectId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_live_sessions_projects_project_id");
+
+                    b.HasOne("ClipForge.Domain.Entities.AppUser", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_live_sessions_users_user_id");
+
+                    b.Navigation("Device");
+
+                    b.Navigation("Project");
                 });
 
             modelBuilder.Entity("ClipForge.Domain.Entities.MediaAsset", b =>

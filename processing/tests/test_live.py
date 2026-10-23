@@ -4,8 +4,11 @@ session language."""
 
 from __future__ import annotations
 
+import itertools
 import math
+import random
 from collections import Counter
+from collections.abc import Iterator
 
 import numpy as np
 import pytest
@@ -127,6 +130,21 @@ def run_live_session(
     return reported
 
 
+def session_peaks(
+    composite: np.ndarray,
+    segments: list[tuple[float, float]],
+    *,
+    min_clip: float,
+    max_clip: float,
+    use_context: bool = True,
+) -> list[float]:
+    """The peaks a live session reports, sorted (each one as many times as reported)."""
+    reported = run_live_session(
+        composite, segments, min_clip=min_clip, max_clip=max_clip, use_context=use_context
+    )
+    return sorted(peak for _, peak in reported)
+
+
 def batch_peaks(composite: np.ndarray, duration: float, min_clip: float, max_clip: float) -> list:
     fusion = detect_candidates(
         duration,
@@ -172,12 +190,15 @@ def test_every_peak_is_reported_exactly_once_across_segments(use_context: bool) 
     assert {peak - 0.5: sequence for sequence, peak in reported} == PLANTED
 
 
-def test_a_segment_shorter_than_the_post_roll_hands_over_at_its_own_start() -> None:
-    """A 6 s segment (postRoll 10 s): the next window's tail is only those 6 s, so the
-    segment hands over at its own start (60), not at 66 - 10 = 56, which the next window
-    could not see: the moment at 57.5 is reported by the short segment."""
+def test_a_segment_shorter_than_the_post_roll_keeps_its_moments_up_to_1_s_before_its_end() -> None:
+    """A 6 s segment (postRoll 10 s): the next window's tail is only those 6 s, so it
+    starts at 60 and its first second can never be a peak. Handing over at 66 - 10 = 56
+    would leave [56, 60) to a window that cannot see it; handing over at the segment's
+    start (60) would leave it the moment of second 60, on that first second. The segment
+    keeps the moments up to 1 s before its end (65), its own window's last second
+    excluded."""
     segments = [(0.0, 60.0), (60.0, 6.0), (66.0, 60.0)]
-    planted = {45: 0, 57: 1, 70: 2, 100: 2, 125: 2}
+    planted = {40: 0, 50: 1, 60: 1, 70: 2, 100: 2, 125: 2}
     composite = bumps(126, list(planted))
     assert batch_peaks(composite, 126.0, 5.0, 20.0) == sorted(k + 0.5 for k in planted)
     for use_context in (True, False):
@@ -186,10 +207,150 @@ def test_a_segment_shorter_than_the_post_roll_hands_over_at_its_own_start() -> N
         )
         assert {peak - 0.5: sequence for sequence, peak in reported} == planted
         assert len(reported) == len(planted)
-    assert handover_point(60.0, 6.0, 10.0) == 60.0
+    assert handover_point(60.0, 6.0, 10.0) == 65.0
     assert commit_range(
         start=66.0, duration=60.0, sequence=2, final=True, post_roll=10.0, previous_duration=6.0
-    ) == CommitRange(60.0, math.inf)
+    ) == CommitRange(65.0, math.inf)
+
+
+# Layouts whose boundaries lost moments when a segment handed over at
+# ``end - min(postRoll, duration)``: segments shorter than about postRoll + 2 s (the API's
+# segmentSeconds 20-31 with the default maxClipSeconds 60), fractional cuts, a short
+# segment 0. A moment is planted on the second of every boundary (the next window's first
+# second when the cut is whole, which can never be a peak there). The moments are 10 s
+# apart, 13 s or more next to the session's start or end (where a clip cannot extend, so it
+# is moved inside the recording and would merge with its neighbour's).
+BOUNDARY_LAYOUTS: dict[str, tuple[list[tuple[float, float]], float, list[int]]] = {
+    "20 s segments, postRoll 30": (
+        [(20.0 * i, 20.0) for i in range(6)],
+        60.0,
+        [5, 20, 30, 40, 50, 60, 70, 80, 90, 100, 119],
+    ),
+    "fractional 20 s cuts, postRoll 30": (
+        [(0.0, 20.033), (20.033, 20.0), (40.033, 20.067), (60.1, 20.0), (80.1, 20.0)],
+        60.0,
+        [5, 20, 30, 40, 50, 60, 70, 80, 99],
+    ),
+    "30 s segments, postRoll 30": (
+        [(30.0 * i, 30.0) for i in range(5)],
+        60.0,
+        [5, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 149],
+    ),
+    "short segment 0, postRoll 10": (
+        [(0.0, 5.0), (5.0, 60.0), (65.0, 30.0)],
+        20.0,
+        [0, 13, 23, 33, 43, 53, 65, 75, 94],
+    ),
+    "segment 0 shorter than 1.5 s, postRoll 10": (
+        [(0.0, 1.2), (1.2, 40.0), (41.2, 30.0)],
+        20.0,
+        [0, 13, 23, 33, 43, 53, 70],
+    ),
+}
+
+
+@pytest.mark.parametrize("layout", list(BOUNDARY_LAYOUTS))
+@pytest.mark.parametrize("use_context", [True, False])
+def test_short_segments_lose_no_moment_at_their_boundaries(layout: str, use_context: bool) -> None:
+    segments, max_clip, planted = BOUNDARY_LAYOUTS[layout]
+    end = segments[-1][0] + segments[-1][1]
+    composite = bumps(math.ceil(end), planted)
+    expected = [k + 0.5 for k in planted]
+    assert batch_peaks(composite, end, 5.0, max_clip) == expected
+    peaks = session_peaks(
+        composite, segments, min_clip=5.0, max_clip=max_clip, use_context=use_context
+    )
+    assert peaks == expected  # every moment, each one once
+
+
+def test_a_window_that_starts_with_the_session_may_peak_on_its_first_second() -> None:
+    """A segment 0 of 1.2 s commits nothing after 0.2 s (1 s before its end): the moment of
+    the session's first second is segment 1's, whose window starts at 0 too, a real
+    edge."""
+    segments, max_clip, planted = BOUNDARY_LAYOUTS["segment 0 shorter than 1.5 s, postRoll 10"]
+    composite = bumps(72, planted)
+    reported = run_live_session(composite, segments, min_clip=5.0, max_clip=max_clip)
+    assert (1, 0.5) in reported
+    plan = plan_window(1.2, 1.2)
+    assert plan.origin == 0.0
+    assert plan.scope(CommitRange(0.2, 31.2), starts_session=False, ends_session=False).left_edge
+
+
+def test_a_moment_next_to_the_window_start_does_not_swallow_its_neighbour() -> None:
+    """minClipSeconds 15, postRoll 30: segment 1's window starts at 15. The moment at 18.5
+    is segment 0's; pushed inside segment 1's window, its clip ([15, 30] instead of the
+    [12.3, 27.3] it has in the recording) would reach the clip of the moment at 37.5
+    (closer than the 2 s merge gap) and swallow it, although the whole recording keeps
+    both."""
+    composite = bumps(120, [18, 37])
+    segments = [(0.0, 60.0), (60.0, 60.0)]
+    assert batch_peaks(composite, 120.0, 15.0, 60.0) == [18.5, 37.5]
+    for use_context in (True, False):
+        reported = run_live_session(
+            composite, segments, min_clip=15.0, max_clip=60.0, use_context=use_context
+        )
+        assert reported == [(0, 18.5), (1, 37.5)]
+
+
+def test_a_moment_next_to_the_window_end_does_not_swallow_its_neighbour() -> None:
+    """postRoll 10: the stronger moment at 57.5 is segment 1's (after 50); pushed inside
+    segment 0's window, which ends at 60, its clip would reach the clip of the moment at
+    38.5 and win the merge, so segment 0 would report neither."""
+    composite = np.maximum(bumps(120, [38], height=3.0), bumps(120, [57], height=3.5))
+    segments = [(0.0, 60.0), (60.0, 60.0)]
+    assert batch_peaks(composite, 120.0, 15.0, 20.0) == [38.5, 57.5]
+    for use_context in (True, False):
+        reported = run_live_session(
+            composite, segments, min_clip=15.0, max_clip=20.0, use_context=use_context
+        )
+        assert reported == [(0, 38.5), (1, 57.5)]
+
+
+def random_layouts(
+    seed: int, count: int
+) -> Iterator[tuple[list[tuple[float, float]], list[int], float, float]]:
+    """Sessions of 2-5 segments around a segment length (20-60 s, keyframe jitter), a
+    quarter of them 2.5-12 s long (OBS file splits), with moments ``max(minClip, 7) +
+    3..13`` s apart (a clip spans at least 7 s around its peak): ``(segments, planted
+    seconds, minClip, maxClip)``."""
+    rng = random.Random(seed)
+    for _ in range(count):
+        max_clip = rng.choice([12.0, 20.0, 60.0])
+        min_clip = rng.choice([m for m in (3.0, 5.0, 8.0, 15.0) if m <= max_clip - 2.0])
+        length = rng.choice([20.0, 25.0, 30.0, 45.0, 60.0])
+        segments: list[tuple[float, float]] = []
+        t = 0.0
+        for _segment in range(rng.randint(2, 5)):
+            short = rng.random() < 0.25
+            duration = round(rng.uniform(2.5, 12.0) if short else length + rng.uniform(-2, 6), 3)
+            segments.append((round(t, 3), duration))
+            t = round(t + duration, 3)
+        planted: list[int] = []
+        k = rng.randint(0, 3)
+        while k < math.ceil(t):
+            planted.append(k)
+            k += max(int(min_clip), 7) + 3 + rng.randint(0, 10)
+        yield segments, planted, min_clip, max_clip
+
+
+@pytest.mark.slow
+def test_random_sessions_report_every_moment_exactly_once() -> None:
+    """Every moment a whole-recording analysis keeps is reported once by the live session,
+    whatever the segment lengths (at least 2.5 s) and clip settings."""
+    checked = 0
+    for segments, planted, min_clip, max_clip in random_layouts(20261023, 60):
+        end = segments[-1][0] + segments[-1][1]
+        composite = bumps(math.ceil(end), planted)
+        expected = [k + 0.5 for k in planted]
+        if batch_peaks(composite, end, min_clip, max_clip) != expected:
+            continue  # moments the whole recording merges: no reference for the session
+        checked += 1
+        for use_context in (True, False):
+            peaks = session_peaks(
+                composite, segments, min_clip=min_clip, max_clip=max_clip, use_context=use_context
+            )
+            assert peaks == expected, (segments, planted, min_clip, max_clip, use_context)
+    assert checked >= 35
 
 
 def test_a_moment_decaying_into_a_window_does_not_hide_the_next_one() -> None:
@@ -228,6 +389,55 @@ def test_window_edges_are_not_peaks_unless_the_session_starts_or_ends_there() ->
 # --------------------------------------------------------------------------------------
 # commit range and window plan
 # --------------------------------------------------------------------------------------
+
+
+def test_the_handover_point_leaves_the_next_window_some_context() -> None:
+    # long enough (postRoll + 9 s or more): end - postRoll, at least 15 s after the next
+    # window's start (its tail is at most 45 s)
+    assert handover_point(60.0, 60.0, 30.0) == 90.0
+    assert handover_point(0.0, 19.0, 10.0) == 9.0
+    # 20 or 30 s segments with postRoll 30: end - postRoll is at (or before) the segment's
+    # start, the next window's first second, never a peak there: 8 s after it instead
+    assert handover_point(20.0, 20.0, 30.0) == 28.0
+    assert handover_point(20.033, 20.0, 30.0) == 29.0  # ceil(20.033) + 8
+    assert handover_point(30.0, 30.0, 30.0) == 38.0
+    # 6 s with postRoll 10: 1 s before its end (its window's last second is never a peak)
+    assert handover_point(60.0, 6.0, 10.0) == 65.0
+    # a sliver: its own start (see the known limits)
+    assert handover_point(29.867, 0.2, 30.0) == 29.867
+    durations = (0.4, 1.0, 2.5, 6.0, 9.0, 20.0, 31.0, 38.5, 45.0, 60.0, 120.0)
+    for start, duration, post_roll in itertools.product(
+        (0.0, 20.033, 61.5), durations, (8.0, 10.0, 30.0)
+    ):
+        point = handover_point(start, duration, post_roll)
+        end = start + duration
+        # within postRoll before the end (where committedUntil is trusted)
+        assert end - min(post_roll, duration) - 1e-6 <= point <= end
+        # every peak before it can be this window's: its last second is never one
+        assert point <= max(start, end - 1.0) + 1e-6
+        # every peak after it can be the next window's: its first second is never one
+        if duration >= 2.5:
+            assert point > plan_window(end, duration).origin + 0.5
+
+
+def test_both_sides_of_a_boundary_use_the_same_handover_point() -> None:
+    """Without ``committedUntil`` the next segment recomputes the previous one's hand-over
+    point from its duration: the very number that segment reported."""
+    durations = (1.0, 6.0, 19.0, 20.0, 25.067, 30.0, 44.9, 60.0)
+    for start, duration, post_roll in itertools.product(
+        (0.0, 20.033, 61.5), durations, (8.0, 10.0, 30.0)
+    ):
+        point = handover_point(start, duration, post_roll)
+        following = {
+            "start": round(start + duration, 3),
+            "duration": 60.0,
+            "sequence": 4,
+            "final": False,
+            "post_roll": post_roll,
+            "previous_duration": duration,
+        }
+        assert commit_range(**following).start == point
+        assert commit_range(**following, committed_until=point).start == point
 
 
 def test_post_roll_is_half_the_maximum_clip_clamped() -> None:
@@ -285,6 +495,9 @@ def test_window_plan_starts_on_a_whole_session_second() -> None:
     plan = plan_window(25.067, 25.067)
     assert plan.origin == 0.0 and plan.media_offset == pytest.approx(0.0)
     assert plan.tail_seconds == pytest.approx(25.067)
+    # that window starts with the session: its first second is a real edge
+    scope = plan.scope(CommitRange(8.0, 34.0), starts_session=False, ends_session=False)
+    assert scope.left_edge and not scope.right_edge
 
     # 51.734 - 26.666 = 25.068 -> the analysis starts on second 26 of the session
     plan = plan_window(51.734, 26.666)

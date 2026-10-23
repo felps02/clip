@@ -36,6 +36,9 @@ Base URL: `http://localhost:5080`. Public routes under `/api`, worker routes und
   guard (`GET /api/auth/me`) applies. With `Auth:CookieDomain` set (e.g. `example.com`) both
   cookies are written and cleared with that `Domain` attribute; host-only copies left from
   before the setting are expired in the same responses. Empty (default) = host-only cookies.
+- Companion (OBS) endpoints under `/api/live` authenticate with a device token instead
+  (`Authorization: Bearer cfd_…`) and refuse the user's cookie/JWT; every other endpoint refuses
+  device tokens (see Live).
 - Rate limits (fixed one-minute windows, all configurable in `RateLimiting`; `429 rate_limited`
   with `Retry-After: 60`): credential endpoints — `register`, `login`, `forgot-password`,
   `reset-password`, `verify-email`, `resend-verification`, `change-password` and
@@ -470,23 +473,119 @@ event never undoes newer state; such an event is answered `200` with `status: ig
 
 ## Live (phase 5) — `/api/live`
 
-`POST /companion/tokens { name }` → `{ token }` (shown once) · `GET /companion/devices` ·
-`DELETE /companion/devices/{id}` · `POST /sessions` (companion, bearer device token) ·
-`POST /sessions/{id}/segments` (multipart: `sequence`, `startOffsetSeconds`,
-`durationSeconds`, `file`) · `POST /sessions/{id}/heartbeat` · `POST /sessions/{id}/end` ·
-`GET /sessions` · `GET /sessions/{id}` → `{ session, segments, highlights: Clip[] }`.
+Live capture from the creator's own OBS recording through the companion. The full contract —
+companion behaviour, resume rules, worker payloads — is `docs/LIVE_CAPTURE.md`; this section is
+what the API implements (`src/ClipForge.Api/Features/Live`).
+
+**Two kinds of callers, never mixed.** User endpoints take the cookie/JWT like the rest of the
+API; a device token there is `401`. Companion endpoints take only a device token
+(`Authorization: Bearer cfd_…`, scheme `Device`); the user's cookie or JWT there is `401`.
+Device tokens are `cfd_` + 40 random base62 characters, shown once at creation; the API keeps
+their SHA-256 hex and the first 8 characters after the prefix (`tokenPrefix`). An unknown or
+revoked token (or the token of an account being deleted) is `401 unauthorized`. Each
+authenticated device request updates `lastSeenAt` (written at most every 30 s).
+
+User endpoints (cookie/JWT):
+
+| Method | Path | Body / query | Response |
+|---|---|---|---|
+| POST | `/companion/tokens` | `{ name }` (1–60 characters, trimmed) | `201 { device: Device, token }` — the only time the token is returned |
+| GET | `/companion/devices` | – | `{ items: Device[] }` — active devices newest first, revoked ones last |
+| DELETE | `/companion/devices/{id}` | – | `204` (also when already revoked); the device's `waiting`/`live`/`ending` sessions go to `error` with `endReason` "dispositivo revogado" (segments already received are still analysed); `404` for another user's device |
+| GET | `/sessions` | `?page&pageSize&status` (`waiting\|live\|ending\|ended\|error`) | paged `{ items: LiveSession[] }`, newest first (sessions of deleted projects are hidden) |
+| GET | `/sessions/{id}` | – | `LiveSessionDetail`; `404` for another user's session |
+| POST | `/sessions/{id}/stop` | – | `202 { session }` with `stopRequested: true` (the companion ends the session when its heartbeat sees it); `409 conflict` when the session is already `ended`/`error` |
+
+Companion endpoints (device token):
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/companion/me` | – | `200 { device: { id, name }, user: { displayName }, plan: { code, name } }` |
+| POST | `/sessions` | `{ title?, segmentSeconds? (20–120, default 60), settings? (partial AnalysisSettings), obs?: { version?, recordingPath? } }` | `201 { session: LiveSession, settings }`; `400 validation_failed`; `409 plan_limit` when the device already has a `waiting`/`live`/`ending` session, or the plan's active-project / concurrent-job caps are reached |
+| POST | `/sessions/{id}/heartbeat` | `{ state: { obsConnected, streaming, recording, uploading, queueLength, lastError } }` | `200 { status, stopRequested, nextSequence }` (`nextSequence` = highest stored sequence + 1); `409 conflict` (`quota_exceeded` when the minutes ran out) once the session is `ended`/`error` |
+| POST | `/sessions/{id}/segments` | `multipart/form-data`: `sequence`, `startOffsetSeconds`, `durationSeconds`, `final?`, then `file` | `201 { segment: LiveSegment, duplicate: false }`; `200 { segment, duplicate: true }`; `400 validation_failed`; `409 conflict` (session terminal); `409 quota_exceeded`; `413 payload_too_large`; `422 invalid_media` |
+| POST | `/sessions/{id}/end` | `{ lastSequence? }` | `200 { session }` — `waiting`/`live` → `ending`, or straight to `ended` when no segment job is pending; repeating it (or calling it on a terminal session) returns the session unchanged |
+
+A session id of another user is `404` on every endpoint (the session is scoped to the token's
+user, not to the device: a user's other device may end it).
+
+- **Session creation.** Runs under the per-user lock like a project creation. The session owns
+  a new project (`sourceKind: "live"`, `sourcePlatform: "obs"`, `status: "processing"`, title
+  from the companion or "Live de dd/MM HH:mm" in the profile's time zone). `settings` are the
+  given fields over the profile's `editingPreferences` (top-level fields replace; `subtitles`
+  and `framing` merge field by field), validated like project settings
+  (`errors["settings.<field>"]`) and capped by the plan. Live projects count as active
+  projects. An open session (or one whose segments are still being analysed) takes **one**
+  concurrent-job slot of the plan, however many segments are queued; its `live_segment` jobs
+  are not counted one by one.
+- **Statuses.** `waiting` (created) → `live` (first segment, or a heartbeat with
+  `recording: true`) → `ending` (`/end`; segments may still arrive and are analysed) → `ended`
+  once every `live_segment` job of the session is terminal. `error` from `waiting`/`live`/
+  `ending`: device revoked ("dispositivo revogado"), monthly minutes exhausted ("minutos de
+  processamento do mês esgotados"), companion silent ("companion offline", see below), project
+  deleted ("projeto excluído"). `endReason` (pt-BR) is also set when the companion ends the
+  session ("encerrada pelo companion", or "encerrada pelo usuário na página Lives" after a stop).
+  Pending segments of an `error` session are still analysed.
+- **Reaper.** Every `Live:ReaperIntervalSeconds` (30), a `waiting`/`live` session without a
+  heartbeat nor a segment for `Live:SessionTimeoutMinutes` (10) goes to `error` "companion
+  offline"; an `ending` session whose segment jobs are all terminal goes to `ended`.
+- **Segment upload.** The text fields must come before `file` (the companion sends them first):
+  `sequence` int 0–1 000 000, `startOffsetSeconds` ≥ 0, `durationSeconds` > 0 and ≤ 300
+  (stored with 3 decimals), `final` `true|false`. Idempotent per `(session, sequence)`: a stored
+  sequence answers `200 duplicate` with the stored segment, without storing anything (parallel
+  retries of one sequence also end with one segment). Uploads are accepted while the session is
+  `waiting`, `live` or `ending`. When the plan's monthly minutes are exhausted (used + reserved ≥
+  limit) the session goes to `error` and the upload is `409 quota_exceeded`. The file must start
+  with the Matroska/WebM (EBML `1A 45 DF A3`) or MP4 (`ftyp`) magic bytes (`422 invalid_media`
+  otherwise) and is streamed to object storage as it arrives (never buffered whole), at most
+  `Live:MaxSegmentMb` (512; `413 payload_too_large`, also when `Content-Length` already says
+  so). Each segment creates a `media_assets` row (kind `live_segment`, status `uploaded`, key
+  `users/{userId}/live/{sessionId}/seg_{sequence:00000}.{mkv|webm|mp4|mov}`), a `live_segments`
+  row and one queued `processing_jobs` row (kind `live_segment`, input = the session's
+  settings). Error answers are sent after the request body was read, so the companion gets the
+  problem instead of a reset connection.
+
+`Device`: `{ id, name, tokenPrefix, createdAt, lastSeenAt, revokedAt, online }` — `online` =
+not revoked and `lastSeenAt` within 60 s.
+
+`LiveSession`: `{ id, projectId, title, status, deviceId, deviceName, segmentSeconds,
+startedAt, endedAt, lastSegmentAt, lastHeartbeatAt, online, stopRequested, endReason,
+companionState: { obsConnected, streaming, recording, uploading, queueLength, lastError },
+stats: { segmentsReceived, segmentsAnalyzed, segmentsFailed, highlights, recordedSeconds } }` —
+`title` is the project's title; `online` = heartbeat within 30 s; `companionState` is the last
+heartbeat (all `false`/`0` before the first one); `highlights` = clips of the session's project
+(not deleted); `recordedSeconds` = sum of the stored segments' durations.
+
+`LiveSessionDetail`: `{ session: LiveSession, settings: AnalysisSettings, segments:
+LiveSegment[] (latest 50 by sequence, newest first), highlights: ClipSummary[] (clips of the
+session's project, newest first, max 50), candidateCount }` (`candidateCount` = moments detected
+by all the session's segments).
+
+`LiveSegment`: `{ id, sequence, startOffsetSeconds, durationSeconds, status, jobId, error,
+createdAt }` — `status` mirrors the segment's job: `received` (stored, before its job exists),
+`queued`, `analyzing` (claimed), `analyzed` (completed), `failed` (failed or cancelled; `error`
+holds the job's message). A failed segment raises no notification of its own (the Lives page
+shows it); each clip a segment job registers raises a `clip_ready` notification "Novo destaque
+na live" with `data { clipId, renderId, projectId, sessionId, jobId }`.
+
+A live project's moments come from every segment job: `GET /api/projects/{id}/candidates` lists
+the candidates of all of them (their commit ranges are disjoint) and `candidateCount` counts
+them; re-analysing a live project is not possible (no single source file), but its clips can be
+cut from a candidate and re-rendered like any other (`render_clip` then carries the session's
+segments, see Internal). Deleting a live project sets its open session to `error`; purging it
+deletes the segment files and assets.
 
 ## Internal — `/internal` (headers `X-Internal-Api-Key`, `X-Worker-Id`)
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| POST | `/workers/{workerId}/claim` | `{ kinds: ["analyze_source","render_clip"], capabilities?: {} }` | `200 JobPayload` (the job is now `preparing_media`, leased to `workerId`; an `analyze_source` claim also moves the project to `processing`, a `render_clip` claim the render to `rendering`) or `204` (queue empty — also when the claimed job cannot be dispatched, e.g. its source is gone or its clip was deleted: that job is failed server-side with the reason) |
+| POST | `/workers/{workerId}/claim` | `{ kinds: ["analyze_source","render_clip","live_segment"], capabilities?: {} }` (without `kinds`: `analyze_source` and `render_clip`) | `200 JobPayload` (the job is now `preparing_media`, leased to `workerId`; an `analyze_source` claim also moves the project to `processing`, a `render_clip` claim the render to `rendering`, a `live_segment` claim the segment to `analyzing`) or `204` (queue empty — also when the claimed job cannot be dispatched, e.g. its source is gone or its clip was deleted: that job is failed server-side with the reason). A `live_segment` job is claimable only when every lower-sequence job of the same session is terminal (`completed`/`failed`/`cancelled`), checked inside the same `FOR UPDATE SKIP LOCKED` statement |
 | POST | `/jobs/{id}/heartbeat` | `{ progress? (0–100), message? (≤ 500) }` | `200 { cancelRequested, leaseExpiresAt }`; `409` if the lease belongs to another worker or the job is not running |
-| POST | `/jobs/{id}/probe` | `{ durationSeconds, width, height, fps, hasAudio, hasVideo, container, videoCodec, audioCodec, sizeBytes }` | `200 { ok: true, remainingProcessingSeconds }` (this job's reservation — replaced on a re-sent probe or a later attempt, never counted twice — already deducted) or `409` problem with `code: quota_exceeded\|plan_limit\|invalid_media` — the job is already marked failed: `invalid_media` for `hasVideo: false` ("arquivo sem vídeo") and for `durationSeconds ≤ 0`, `plan_limit` for a source longer than the plan allows, `quota_exceeded` for not enough minutes left |
+| POST | `/jobs/{id}/probe` | `{ durationSeconds, width, height, fps, hasAudio, hasVideo, container, videoCodec, audioCodec, sizeBytes }` | `200 { ok: true, remainingProcessingSeconds }` (this job's reservation — replaced on a re-sent probe or a later attempt, never counted twice — already deducted) or `409` problem with `code: quota_exceeded\|plan_limit\|invalid_media` — the job is already marked failed: `invalid_media` for `hasVideo: false` ("arquivo sem vídeo") and for `durationSeconds ≤ 0`, `plan_limit` for a source longer than the plan allows, `quota_exceeded` for not enough minutes left. A `live_segment` probe reserves the segment's duration exactly like an uploaded source (and is charged at `/complete` the same way); its `quota_exceeded` also sets the live session to `error` |
 | POST | `/jobs/{id}/status` | `{ status, progress?, message? (≤ 500) }` | `200 Job`; re-posting the running status the job already has is an idempotent progress update (`200`); an invalid transition → `409` |
 | POST | `/jobs/{id}/events` | `{ level: "info"\|"warning"\|"error", message (1–1000 characters), data? }` | `201`; a longer message → `400 validation_failed` |
 | POST | `/jobs/{id}/upload-urls` | `{ files: [ { kind: "clip_render"\|"thumbnail"\|"analysis"\|"preview", fileName, contentType, sizeBytes? } ] }` | `200 { files: [ { fileName, key, url, method, headers } ] }` |
-| POST | `/jobs/{id}/analysis` | `{ transcriptKey?, signalsKey?, summary: { signals: {...}, webcamRegion?, language?, processedSeconds, candidatesFound?, clipsRendered? } }` | `200` |
+| POST | `/jobs/{id}/analysis` | `{ transcriptKey?, signalsKey?, summary: { signals: {...}, webcamRegion?, language?, processedSeconds, candidatesFound?, clipsRendered?, liveContext? } }` | `200` — `liveContext` (live_segment) is stored on the segment and becomes the `context` of the next segment's payload (also read from the `/complete` summary) |
 | POST | `/jobs/{id}/candidates` | `{ candidates: CandidateInput[] }` | `200 { ids: [...] }` (replaces previous candidates of this job; order preserved). On a retried attempt (`attempt > 1`) it also removes the clips a previous attempt auto-rendered for this job — rows, renders and storage objects — so the new attempt's `/clips` never duplicates them (clips the user re-rendered through a render job are kept) |
 | POST | `/jobs/{id}/clips` | `{ clips: [ { candidateId, title, aspectRatio, startSeconds, endSeconds, subtitles, framing, render: { storageKey, width, height, durationSeconds, sizeBytes, hasSubtitles }, thumbnailKey } ] }` | `200 { clips: [ { candidateId, clipId, renderId } ] }` |
 | POST | `/jobs/{id}/render-result` | `{ renderId, status: "ready"\|"failed", storageKey?, width?, height?, durationSeconds?, sizeBytes?, hasSubtitles?, thumbnailKey?, error? }` | `200` |
@@ -553,6 +652,35 @@ reached the API (`docs/PROCESSING_PIPELINE.md`, "Retries of internal calls").
   "limits": { "maxRenderHeight": 1080, "allowWebcamLayout": true }
 }
 ```
+
+`JobPayload` (live_segment) — the `analyze_source` fields (`source` is the segment file, `settings`
+the session's settings, `limits` as above) plus:
+
+```json
+{
+  "live": { "sessionId": "…", "segmentId": "…", "sequence": 3, "startOffsetSeconds": 180.0,
+            "durationSeconds": 60.0, "final": false, "segmentSeconds": 60 },
+  "source": { "assetId": "…", "downloadUrl": "…", "fileName": "seg_00003.mkv",
+              "contentType": "video/x-matroska", "sizeBytes": 123, "durationSeconds": 60.0 },
+  "previous": { "segmentId": "…", "sequence": 2, "downloadUrl": "…", "startOffsetSeconds": 120.0,
+                "durationSeconds": 60.0, "fileName": "seg_00002.mkv", "contentType": "video/x-matroska", "sizeBytes": 120 },
+  "context": { "compositeSample": [1.2, 0.8], "language": "pt", "sequence": 2, "committedUntil": 172.0 }
+}
+```
+
+`previous` is the segment `sequence − 1` with a signed download URL, `null` for sequence 0, when
+that segment does not exist or when it failed. `context` is the `liveContext` the closest earlier
+segment reported (normally `sequence − 1`; after a failed segment the one before it, so the score
+sample and the language are not lost — the worker only trusts `committedUntil` when
+`context.sequence` is `sequence − 1`), `null` before any. `source.durationSeconds` is the probed
+duration once known, else the companion's.
+
+`JobPayload` (render_clip of a live project): as above but with `segments` instead of `source`:
+`segments: [ { downloadUrl, startOffsetSeconds, durationSeconds, fileName, contentType, sizeBytes } ]`
+— every stored segment of the session overlapping `[clip.startSeconds, clip.endSeconds)` (session
+times), in sequence order; `analysis.transcriptUrl`/`webcamRegion` come from the `live_segment` job
+that detected the clip's moment (else the analysed segment holding the clip's middle). No usable
+segment → the claim fails the job (`invalid_media`).
 
 `settings` is the project's stored `AnalysisSettings`, capped by the plan when the job is claimed:
 `autoRenderTop` is always a number, `focusCategories`/`customKeywords` are normalised lists (possibly

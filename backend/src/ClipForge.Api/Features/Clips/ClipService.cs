@@ -66,9 +66,11 @@ public sealed class ClipService
     private readonly SubscriptionService _subscriptions;
     private readonly QuotaService _quotas;
     private readonly IClock _clock;
+    private readonly Live.LiveJobSupport _live;
 
-    public ClipService(AppDbContext db, MediaUrls urls, RenderService renders, SubscriptionService subscriptions, QuotaService quotas, IClock clock)
+    public ClipService(AppDbContext db, MediaUrls urls, RenderService renders, SubscriptionService subscriptions, QuotaService quotas, IClock clock, Live.LiveJobSupport live)
     {
+        _live = live;
         _db = db;
         _urls = urls;
         _renders = renders;
@@ -230,7 +232,15 @@ public sealed class ClipService
     public async Task<(Clip Clip, ProcessingJob Job, ClipRender Render)> RenderAsync(Guid userId, Guid clipId, CancellationToken ct)
     {
         var clip = await GetOwnedAsync(userId, clipId, ct);
-        if (clip.Project.MediaAsset is not { IsUsable: true })
+        if (clip.Project.SourceKind == SourceKind.Live)
+        {
+            // A clip of a live is rendered from the session's segments that overlap it.
+            if (!await _live.HasUsableSegmentsAsync(clip.ProjectId, ct))
+            {
+                throw AppException.InvalidMedia("Os segmentos desta live não estão mais disponíveis.");
+            }
+        }
+        else if (clip.Project.MediaAsset is not { IsUsable: true })
         {
             throw AppException.InvalidMedia("O arquivo de origem não está mais disponível.");
         }

@@ -133,15 +133,17 @@ API.
 segment and the previous one are downloaded, the segment is probed (`/probe`), the two are
 joined without re-encoding (concat demuxer) and the last `min(45 s, previous)` of the
 previous one + the segment are analysed on a grid of whole session seconds, with the same
-signals and fusion. Only the candidates of the **commit rule** are reported
-(`postRoll = clamp(maxClipSeconds / 2, 8, 30)`, peaks in `[start − postRoll, end − postRoll)`,
-the first segment from the start, the final one to its end), in session times, scored
-against the session's composite sample; the session language is fixed by the first segment
-with speech. The top `autoRenderTop` are rendered from the joined file; `/analysis` returns
-`summary.liveContext` (`compositeSample`, `language`, `sequence`, `committedUntil`), which
-the next segment receives as `context`. A `render_clip` of a live project receives
-`segments` instead of `source`: they are joined the same way and the clip's session range
-is cut from the result.
+signals and fusion. Only the candidates of the **commit rule** are reported: peaks from
+the previous segment's hand-over point to this one's, which is `end − postRoll`
+(`postRoll = clamp(maxClipSeconds / 2, 8, 30)`) but never before the next window's first
+whole second + 8 s nor after `end − 1` (the first segment from the start, the final one to
+its end), in session times, scored against the session's composite sample; the session
+language is fixed by the first segment with speech. The top `autoRenderTop` are rendered
+from the joined file; `/analysis` returns `summary.liveContext` (`compositeSample`,
+`language`, `sequence`, `committedUntil`), which the next segment receives as `context`. A
+`render_clip` of a live project receives `segments` instead of `source`: they are joined
+the same way (a segment only needs a duration: the last one of a session is often a
+sliver) and the clip's session range is cut from the result.
 
 `maxRenderHeight` is treated as the resolution class of the shorter side: `>= 1080` →
 1920×1080 / 1080×1920 / 1080×1080, otherwise 1280×720 / 720×1280 / 720×720 (480p below 720).
@@ -177,9 +179,10 @@ leftovers (`WORK_DIR_ORPHAN_MINUTES`).
 
 The live tests (`tests/test_live*.py`) cut the e2e fixture
 (`%LOCALAPPDATA%/ClipForge/fixtures/e2e-fixture.mp4`, or `CLIPFORGE_E2E_FIXTURE`) into
-Matroska segments of ~25 s with the segment muxer, the way the companion cuts a recording,
-in a temporary directory removed afterwards (skipped without the fixture); the commit rule
-is also tested on synthetic composite series.
+Matroska segments of ~25 s and ~21 s with the segment muxer, the way the companion cuts a
+recording (skipped without the fixture), and the 20 s synthetic video into a 19.8 s segment
+and a final 0.2 s sliver, in temporary directories removed afterwards; the commit rule is
+also tested on synthetic composite series (boundary layouts and seeded random sessions).
 
 The fast suite synthesises its fixtures under `tests/fixtures/generated/` (git-ignored): a
 90 s `testsrc2` video with three loud bursts and two scene cuts, a 20 s variant for the

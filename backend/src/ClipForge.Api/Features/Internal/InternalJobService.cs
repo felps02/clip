@@ -1,4 +1,5 @@
 using System.Data;
+using ClipForge.Api.Features.Live;
 using ClipForge.Api.Features.Projects;
 using ClipForge.Api.Options;
 using ClipForge.Api.Services;
@@ -31,6 +32,7 @@ public sealed class InternalJobService
     private readonly IObjectStorage _storage;
     private readonly IClock _clock;
     private readonly JobsOptions _jobs;
+    private readonly LiveJobSupport _live;
     private readonly ILogger<InternalJobService> _logger;
 
     public InternalJobService(
@@ -44,8 +46,10 @@ public sealed class InternalJobService
         IObjectStorage storage,
         IClock clock,
         IOptions<JobsOptions> jobs,
+        LiveJobSupport live,
         ILogger<InternalJobService> logger)
     {
+        _live = live;
         _db = db;
         _quotas = quotas;
         _subscriptions = subscriptions;
@@ -63,7 +67,9 @@ public sealed class InternalJobService
 
     /// <summary>
     /// Claims the queued job with the highest priority then the oldest queued_at among the requested kinds using a
-    /// single UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING statement.
+    /// single UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING statement. A live_segment job is only
+    /// claimable once every lower-sequence job of its session is terminal (segments are analysed in order, each one with
+    /// the context its predecessor reported).
     /// </summary>
     public async Task<object?> ClaimAsync(string workerId, string[]? kinds, CancellationToken ct)
     {
@@ -96,9 +102,16 @@ public sealed class InternalJobService
                     progress = 0,
                     status_message = 'Preparando mídia'
                 WHERE id = (
-                    SELECT id FROM processing_jobs
-                    WHERE status = 'queued' AND kind = ANY(@kinds)
-                    ORDER BY priority DESC, queued_at ASC NULLS LAST, created_at ASC
+                    SELECT j.id FROM processing_jobs j
+                    WHERE j.status = 'queued' AND j.kind = ANY(@kinds)
+                      AND (j.kind <> 'live_segment' OR NOT EXISTS (
+                            SELECT 1
+                            FROM live_segments s
+                            JOIN live_segments earlier ON earlier.session_id = s.session_id AND earlier.sequence < s.sequence
+                            JOIN processing_jobs earlier_job ON earlier_job.id = earlier.job_id
+                            WHERE s.job_id = j.id
+                              AND earlier_job.status NOT IN ('completed', 'failed', 'cancelled')))
+                    ORDER BY j.priority DESC, j.queued_at ASC NULLS LAST, j.created_at ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
                 )
@@ -143,6 +156,7 @@ public sealed class InternalJobService
             return null;
         }
 
+        await _live.OnJobStatusChangedAsync(job, ct);
         await _db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
         return payload;
@@ -151,16 +165,21 @@ public sealed class InternalJobService
     private async Task<object> BuildPayloadAsync(ProcessingJob job, CancellationToken ct)
     {
         var project = job.Project;
+        var leaseSeconds = Math.Max(10, _jobs.LeaseSeconds);
+        var liveProject = project.SourceKind == SourceKind.Live;
+        if (job.Kind == JobKind.LiveSegment)
+        {
+            return await _live.BuildSegmentPayloadAsync(job, await _quotas.GetUsageAsync(job.UserId, ct), leaseSeconds, ct);
+        }
+
         var asset = project.MediaAsset;
-        if (asset is not { IsUsable: true })
+        if (!liveProject && asset is not { IsUsable: true })
         {
             throw AppException.InvalidMedia("O arquivo de origem do projeto não está disponível.");
         }
 
         var usage = await _quotas.GetUsageAsync(job.UserId, ct);
         var limits = usage.Entitlement.Limits;
-        var source = new JobPayloadSource(asset.Id, await _urls.WorkerDownloadAsync(asset.StorageKey, ct), asset.OriginalFileName, asset.ContentType, asset.SizeBytes, asset.DurationSeconds);
-        var leaseSeconds = Math.Max(10, _jobs.LeaseSeconds);
 
         if (job.Kind == JobKind.RenderClip)
         {
@@ -176,12 +195,18 @@ public sealed class InternalJobService
 
             render.Status = RenderStatus.Rendering;
 
-            var analyzeJob = await _db.ProcessingJobs
+            var analyzeJob = liveProject ? null : await _db.ProcessingJobs
                 .Where(j => j.ProjectId == project.Id && j.Kind == JobKind.AnalyzeSource && j.Status == JobStatus.Completed)
                 .OrderByDescending(j => j.FinishedAt).ThenByDescending(j => j.CreatedAt)
                 .FirstOrDefaultAsync(ct);
+            var transcriptKey = analyzeJob?.TranscriptStorageKey;
+            WebcamRegion? liveWebcam = null;
+            if (liveProject)
+            {
+                (transcriptKey, liveWebcam) = await _live.RenderAnalysisAsync(clip, ct);
+            }
             string? transcriptUrl = null;
-            if (analyzeJob?.TranscriptStorageKey is { Length: > 0 } transcriptKey)
+            if (transcriptKey is { Length: > 0 })
             {
                 transcriptUrl = await _urls.WorkerDownloadAsync(transcriptKey, ct);
             }
@@ -190,17 +215,32 @@ public sealed class InternalJobService
             framing.FocusX ??= 0.5;
             framing.FocusY ??= 0.5;
 
-            return new RenderJobPayload(job.Id, job.Kind, job.Attempt, job.UserId, project.Id, leaseSeconds, source,
-                new RenderClipInfo(clip.Id, render.Id, render.Version, clip.Title, clip.StartSeconds, clip.EndSeconds, clip.AspectRatio, clip.Subtitles, framing),
-                new RenderAnalysisInfo(transcriptUrl, analyzeJob?.Result?.WebcamRegion),
-                new RenderPayloadLimits(limits.MaxRenderHeight, limits.AllowWebcamLayout));
+            var clipInfo = new RenderClipInfo(clip.Id, render.Id, render.Version, clip.Title, clip.StartSeconds, clip.EndSeconds, clip.AspectRatio, clip.Subtitles, framing);
+            var renderLimits = new RenderPayloadLimits(limits.MaxRenderHeight, limits.AllowWebcamLayout);
+            if (liveProject)
+            {
+                return new LiveRenderJobPayload(job.Id, job.Kind, job.Attempt, job.UserId, project.Id, leaseSeconds,
+                    await _live.RenderSegmentsAsync(project.Id, clip.StartSeconds, clip.EndSeconds, ct), clipInfo,
+                    new RenderAnalysisInfo(transcriptUrl, liveWebcam), renderLimits);
+            }
+
+            return new RenderJobPayload(job.Id, job.Kind, job.Attempt, job.UserId, project.Id, leaseSeconds, await SourceOfAsync(asset!, ct), clipInfo,
+                new RenderAnalysisInfo(transcriptUrl, analyzeJob?.Result?.WebcamRegion), renderLimits);
         }
 
+        if (liveProject)
+        {
+            throw AppException.Conflict("Projetos de live são analisados segmento a segmento; não há um arquivo único para reanalisar.");
+        }
+        var source = await SourceOfAsync(asset!, ct);
         var settings = JsonDefaults.Deserialize<AnalysisSettings>(job.Input) ?? project.Settings;
         settings = PlanLimitHelpers.CapSettings(settings, limits);
         return new AnalyzeJobPayload(job.Id, job.Kind, job.Attempt, job.UserId, project.Id, leaseSeconds, source, settings,
             new AnalyzePayloadLimits(limits.MaxRenderHeight, limits.MaxSourceDurationSeconds, usage.RemainingProcessingSeconds, limits.TranscriptionModel, limits.AllowWebcamLayout));
     }
+
+    private async Task<JobPayloadSource> SourceOfAsync(MediaAsset asset, CancellationToken ct)
+        => new(asset.Id, await _urls.WorkerDownloadAsync(asset.StorageKey, ct), asset.OriginalFileName, asset.ContentType, asset.SizeBytes, asset.DurationSeconds);
 
     // ---------------------------------------------------------------- helpers
 
@@ -321,7 +361,7 @@ public sealed class InternalJobService
     private async Task CancelAsync(ProcessingJob job, string message, CancellationToken ct)
     {
         var now = _clock.UtcNow;
-        var charged = job.Kind == JobKind.AnalyzeSource && JobStateMachine.HasStartedProcessing(job.Status) ? job.ReservedSeconds : 0;
+        var charged = job.Kind is JobKind.AnalyzeSource or JobKind.LiveSegment && JobStateMachine.HasStartedProcessing(job.Status) ? job.ReservedSeconds : 0;
         _events.Add(job, message, job.Status, JobStatus.Cancelled, data: new { chargedSeconds = charged });
         await ChargeProcessingAsync(job, charged, "cancelled", null, ct);
         job.Status = JobStatus.Cancelled;
@@ -332,12 +372,13 @@ public sealed class InternalJobService
         job.UpdatedAt = now;
         await _projects.UpdateProjectStatusAfterJobAsync(job, ct);
         await FailPendingRenderAsync(job, "Renderização cancelada.", ct);
+        await _live.OnJobStatusChangedAsync(job, ct);
     }
 
-    /// <summary>Appends the processing_seconds usage of an analyze_source job (append-only, audited with the reason).</summary>
+    /// <summary>Appends the processing_seconds usage of an analyze_source or live_segment job (append-only, audited with the reason).</summary>
     private async Task ChargeProcessingAsync(ProcessingJob job, decimal seconds, string reason, decimal? processedSeconds, CancellationToken ct)
     {
-        if (job.Kind != JobKind.AnalyzeSource || seconds <= 0) return;
+        if (job.Kind is not (JobKind.AnalyzeSource or JobKind.LiveSegment) || seconds <= 0) return;
         var entitlement = await _subscriptions.GetEntitlementAsync(job.UserId, ct);
         _quotas.RecordUsage(entitlement, job.UserId, UsageKind.ProcessingSeconds, seconds, job.Id, job.ProjectId, null,
             JsonDefaults.Serialize(new { reason, reservedSeconds = job.ReservedSeconds, processedSeconds }));
@@ -374,6 +415,10 @@ public sealed class InternalJobService
         }
 
         var asset = job.Project.MediaAsset;
+        if (job.Kind == JobKind.LiveSegment)
+        {
+            asset = (await _live.SegmentOfJobAsync(job.Id, ct))?.MediaAsset;
+        }
         if (asset is not null)
         {
             asset.DurationSeconds = request.DurationSeconds;
@@ -387,7 +432,7 @@ public sealed class InternalJobService
             if (asset.Status == MediaAssetStatus.Uploaded) asset.Status = MediaAssetStatus.Verified;
         }
 
-        if (job.Kind != JobKind.AnalyzeSource)
+        if (job.Kind is not (JobKind.AnalyzeSource or JobKind.LiveSegment))
         {
             ExtendLease(job, _clock.UtcNow);
             await _db.SaveChangesAsync(ct);
@@ -420,6 +465,12 @@ public sealed class InternalJobService
     /// <summary>A probe the API refuses (no video, unknown duration, plan/quota): the job fails server-side and the worker gets 409 with the code.</summary>
     private async Task RejectProbeAsync(ProcessingJob job, string code, string message, CancellationToken ct)
     {
+        if (job.Kind == JobKind.LiveSegment && code == ErrorCodes.QuotaExceeded
+            && await _live.SegmentOfJobAsync(job.Id, ct) is { Session: { } session })
+        {
+            // Monthly minutes exhausted: the live session stops here (its next uploads answer 409 quota_exceeded).
+            await _live.SetSessionErrorAsync(session, LiveService.QuotaExhaustedReason, ct);
+        }
         await MarkFailedAsync(job, code, message, ct);
         await _db.SaveChangesAsync(ct);
         await _notifications.FlushAsync();
@@ -460,6 +511,7 @@ public sealed class InternalJobService
             job.SignalsStorageKey = request.SignalsKey;
         }
         MergeSummary(job, request.Summary);
+        await _live.StoreLiveContextAsync(job, request.Summary?.LiveContext, ct);
         job.UpdatedAt = _clock.UtcNow;
         _events.Add(job, "Artefatos de análise registrados", data: new { request.TranscriptKey, request.SignalsKey });
         await _db.SaveChangesAsync(ct);
@@ -659,6 +711,17 @@ public sealed class InternalJobService
         job.Result = result;
         job.UpdatedAt = now;
         _events.Add(job, $"{created.Count} clipes renderizados");
+        if (job.Kind == JobKind.LiveSegment && created.Count > 0)
+        {
+            // Each live highlight is announced as soon as its clip exists (docs/LIVE_CAPTURE.md §4).
+            var sessionId = (await _live.SegmentOfJobAsync(job.Id, ct))?.SessionId;
+            foreach (var item in created)
+            {
+                var clip = await _db.Clips.FirstAsync(c => c.Id == item.ClipId, ct);
+                _notifications.Add(job.UserId, NotificationType.ClipReady, "Novo destaque na live", $"\"{clip.Title}\" está pronto em \"{project.Title}\".",
+                    new { clipId = item.ClipId, renderId = item.RenderId, projectId = project.Id, sessionId, jobId = job.Id });
+            }
+        }
         await _db.SaveChangesAsync(ct);
         return new ClipsResponse(created);
     }
@@ -729,7 +792,8 @@ public sealed class InternalJobService
         var result = job.Result ?? new JobResult();
         if (processedSeconds is not null) result.ProcessedSeconds = processedSeconds;
 
-        if (job.Kind == JobKind.AnalyzeSource)
+        await _live.StoreLiveContextAsync(job, summary?.LiveContext, ct);
+        if (job.Kind is JobKind.AnalyzeSource or JobKind.LiveSegment)
         {
             var seconds = job.ReservedSeconds > 0 ? job.ReservedSeconds : (processedSeconds ?? 0m);
             await ChargeProcessingAsync(job, seconds, "completed", processedSeconds, ct);
@@ -754,6 +818,7 @@ public sealed class InternalJobService
         job.UpdatedAt = now;
 
         await _projects.UpdateProjectStatusAfterJobAsync(job, ct);
+        await _live.OnJobStatusChangedAsync(job, ct);
 
         if (job.Kind == JobKind.AnalyzeSource)
         {
@@ -790,6 +855,7 @@ public sealed class InternalJobService
         if (request.Retryable && job.Attempt < job.MaxAttempts)
         {
             Requeue(job, code, message);
+            await _live.OnJobStatusChangedAsync(job, ct);
         }
         else
         {
@@ -828,7 +894,7 @@ public sealed class InternalJobService
     public async Task MarkFailedAsync(ProcessingJob job, string code, string message, decimal? processedSeconds, CancellationToken ct)
     {
         var now = _clock.UtcNow;
-        var charged = job.Kind == JobKind.AnalyzeSource && job.ReservedSeconds > 0 && processedSeconds is > 0
+        var charged = job.Kind is JobKind.AnalyzeSource or JobKind.LiveSegment && job.ReservedSeconds > 0 && processedSeconds is > 0
             ? Math.Min(processedSeconds.Value, job.ReservedSeconds)
             : 0m;
         _events.Add(job, $"Falha ({code}): {message}", job.Status, JobStatus.Failed, JobEventLevel.Error, new { code, message, chargedSeconds = charged });
@@ -848,6 +914,13 @@ public sealed class InternalJobService
         }
         await _projects.UpdateProjectStatusAfterJobAsync(job, ct);
         await FailPendingRenderAsync(job, message, ct);
+        await _live.OnJobStatusChangedAsync(job, ct);
+        if (job.Kind == JobKind.LiveSegment)
+        {
+            // A failed segment shows on the Lives page (segment timeline and counters); one notification per segment
+            // of a live would be noise.
+            return;
+        }
 
         _notifications.Add(job.UserId, NotificationType.JobFailed,
             job.Kind == JobKind.RenderClip ? "Falha na renderização" : $"Falha na análise: {job.Project?.Title}",
@@ -909,6 +982,7 @@ public sealed class InternalJobService
             if (job.Attempt < job.MaxAttempts)
             {
                 Requeue(job, "lease_expired", $"O worker {job.WorkerId} parou de responder");
+                await _live.OnJobStatusChangedAsync(job, ct);
                 _logger.LogWarning("Job {JobId} lease expired; requeued (attempt {Attempt}/{Max})", job.Id, job.Attempt, job.MaxAttempts);
             }
             else

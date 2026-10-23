@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,7 @@ from app.analysis.audio_features import AudioFeatures
 from app.analysis.fusion import (
     BASE_WEIGHTS,
     FusionSettings,
+    PeakScope,
     Window,
     audio_energy_text,
     build_reasoning,
@@ -199,6 +202,52 @@ def test_window_bounds_clamped_to_recording() -> None:
     start, end = expand_window(composite, 98, 1.5, SETTINGS, float(n))
     assert end == pytest.approx(float(n))
     assert end - start >= SETTINGS.min_clip
+
+
+def test_an_edge_that_is_not_the_recordings_does_not_move_the_window() -> None:
+    """A live window passes an infinite bound for an edge that is not the recording's:
+    the window keeps its place beyond that edge (same length) instead of being pushed
+    inside; snap_window clips to the same bounds."""
+    n = 100
+    composite = np.zeros(n)
+    composite[2] = 4.0
+    assert expand_window(composite, 2, 1.5, SETTINGS, float(n)) == pytest.approx((0.0, 15.0))
+    free = expand_window(composite, 2, 1.5, SETTINGS, float(n), bounds=(-math.inf, float(n)))
+    assert free == pytest.approx((-3.7, 11.3))
+    composite = np.zeros(n)
+    composite[98] = 4.0
+    assert expand_window(composite, 98, 1.5, SETTINGS, float(n)) == pytest.approx((85.0, 100.0))
+    free = expand_window(composite, 98, 1.5, SETTINGS, float(n), bounds=(0.0, math.inf))
+    assert free == pytest.approx((92.3, 107.3))
+    none = np.array([], dtype=np.float64)
+    snap = {"start_anchors": none, "end_anchors": none, "settings": SETTINGS, "duration": 100.0}
+    assert snap_window(-3.7, 11.3, 2, **snap, bounds=(-math.inf, 100.0)) == (-3.7, 11.3)
+    assert snap_window(-3.7, 11.3, 2, **snap) == (0.0, 11.3)
+
+
+def test_a_live_window_merges_as_the_recording_and_reports_inside_its_media() -> None:
+    """At the recording's start the window of the moment at 3 s is pushed to [0, 15] and
+    merges with the one at 22 s; at the start of a live window (not the recording's) it is
+    compared where it lies in the recording, [-2.7, 12.3], and does not. The windows
+    reported stay inside the media: those of unmerged moments are exactly the windows
+    computed inside it."""
+    n = 60
+    audio = audio_with_peaks(n, {3: 3.0, 22: 3.0, 56: 3.0})
+    whole = detect_candidates(float(n), SETTINGS, audio=audio, transcript=None, visual=None)
+    assert sorted((c.peak, c.start, c.end) for c in whole.candidates) == pytest.approx(
+        [(3.5, 0.0, 31.3), (56.5, 45.0, 60.0)]
+    )
+    live = detect_candidates(
+        float(n),
+        SETTINGS,
+        audio=audio,
+        transcript=None,
+        visual=None,
+        scope=PeakScope(left_edge=False, right_edge=False),
+    )
+    assert sorted((c.peak, c.start, c.end) for c in live.candidates) == pytest.approx(
+        [(3.5, 0.0, 15.0), (22.5, 16.3, 31.3), (56.5, 45.0, 60.0)]
+    )
 
 
 def test_pick_peaks_respects_min_distance() -> None:

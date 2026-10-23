@@ -106,7 +106,7 @@ the row (`SELECT … FOR UPDATE`).
 
 ### projects (= MediaSource)
 `id` · `user_id` FK · `title` · `source_kind` (`upload|link|live`) · `source_url` (nullable) ·
-`source_platform` (`upload|twitch|youtube|kick|other`) · `media_asset_id` FK (nullable) ·
+`source_platform` (`upload|twitch|youtube|kick|other|obs`; `obs` for live projects, whose `media_asset_id` stays null — their media are the session's `live_segments`) · `media_asset_id` FK (nullable) ·
 `status` (`created|processing|ready|failed|cancelled`) · `settings` jsonb (`AnalysisSettings`) ·
 `client_request_id` (nullable; unique `(user_id, client_request_id)`) · `created_at` ·
 `updated_at` · `deleted_at`. Index `(user_id, created_at desc)`.
@@ -179,23 +179,50 @@ second step; deleting a clip deletes its renders, deleting a render clears the p
 periodEnd }` and exist at most once per threshold and billing period. E-mail copies are not
 stored (docs/API.md → Notifications).
 
-### live_sessions / live_segments (phase 5)
-`live_sessions`: `id` · `user_id` · `project_id` · `source` (`obs_companion`) · `status`
-(`waiting|live|ended|error`) · `companion_device_id` · `started_at` · `ended_at` ·
-`last_segment_at` · `settings` jsonb.
-`live_segments`: `id` · `session_id` · `sequence` int · `media_asset_id` ·
-`start_offset_seconds` · `duration_seconds` · `status` (`received|analyzing|analyzed|failed`) ·
-`created_at`. Unique `(session_id, sequence)`.
+### companion_devices (live capture, phase 5)
+A computer running the OBS companion (docs/LIVE_CAPTURE.md). `id` · `user_id` FK (cascade) ·
+`name` (1–60) · `token_hash` (SHA-256 hex of the whole `cfd_…` token, unique; the token itself is
+never stored) · `token_prefix` (the 8 characters after `cfd_`, for display) · `created_at` ·
+`last_seen_at` (last authenticated request, written at most every 30 s) · `revoked_at`.
+Index `(user_id, created_at)`.
 
-### companion_devices (phase 5)
-`id` · `user_id` · `name` · `token_hash` (unique) · `last_seen_at` · `revoked_at` · `created_at`.
+### live_sessions (live capture)
+`id` · `user_id` FK (cascade) · `device_id` FK → `companion_devices` (cascade) · `project_id`
+FK → `projects` (cascade; unique — each session owns one project with `source_kind = live`,
+`source_platform = obs`) · `status` (`waiting|live|ending|ended|error`) · `segment_seconds` int
+(20–120) · `settings` jsonb (`AnalysisSettings`, capped by the plan) · `companion_state` jsonb
+(nullable: the last heartbeat `{ obsConnected, streaming, recording, uploading, queueLength,
+lastError }`) · `stop_requested` bool · `end_reason` (≤ 500, pt-BR: "dispositivo revogado",
+"companion offline", "minutos de processamento do mês esgotados", "projeto excluído", "encerrada
+pelo companion", …) · `obs` jsonb (nullable: `{ version, recordingPath }` sent at creation) ·
+`started_at` · `ended_at` · `last_segment_at` · `last_heartbeat_at` · `updated_at`.
+Indexes: `(user_id, started_at desc)`; unique `(device_id)` filtered on
+`status IN ('waiting','live','ending')` — at most one non-terminal session per device;
+`(status, last_heartbeat_at)` with the same filter (the reaper).
+
+### live_segments (live capture)
+`id` · `session_id` FK (cascade) · `user_id` FK (cascade) · `sequence` int · `media_asset_id`
+FK → `media_assets` (kind `live_segment`; set null) · `job_id` FK → `processing_jobs` (its
+`live_segment` job; set null) · `start_offset_seconds` numeric(12,3) (session time) ·
+`duration_seconds` numeric(12,3) · `is_final` bool · `status`
+(`received|queued|analyzing|analyzed|failed`, mirrors the job) · `error` (≤ 2000, the job's
+message when it failed) · `live_context` jsonb (nullable: the `liveContext` the job reported, the
+`context` of the next segment's payload) · `created_at` · `updated_at`.
+Unique `(session_id, sequence)` (uploads are idempotent per sequence); indexes `(job_id)`,
+`(media_asset_id)`, `(user_id)`. The claim of a `live_segment` job checks, through `job_id`,
+that every lower-sequence job of the session is terminal.
+
+All three tables were added by the `20261023182826_LiveCapture` migration (new tables only, so it
+applies to a database that already has data).
 
 ## Relationships
 
 ```
 users 1─1 user_profiles
 users 1─* refresh_tokens, subscriptions, usage_records, media_assets, projects,
-          processing_jobs, clips, notifications, integration_connections
+          processing_jobs, clips, notifications, integration_connections, companion_devices
+companion_devices 1─* live_sessions (at most one waiting/live/ending)
+projects 1─0..1 live_sessions 1─* live_segments ─ media_assets (live_segment), processing_jobs (live_segment)
 plans 1─* subscriptions
 subscriptions 1─* subscription_events
 projects 1─* processing_jobs 1─* processing_job_events

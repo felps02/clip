@@ -168,6 +168,20 @@ public sealed class MediaOptions
     public int ThumbnailUrlMinutes { get; set; } = 60;
 }
 
+/// <summary>Live capture (docs/LIVE_CAPTURE.md): companion sessions and segment uploads.</summary>
+public sealed class LiveOptions
+{
+    public const string SectionName = "Live";
+    /// <summary>A waiting/live session without a heartbeat (nor a segment) for this long goes to error ("companion offline").</summary>
+    public int SessionTimeoutMinutes { get; set; } = 10;
+    /// <summary>Largest segment file accepted by POST /api/live/sessions/{id}/segments.</summary>
+    public int MaxSegmentMb { get; set; } = 512;
+    /// <summary>How often the reaper looks for silent sessions and finished "ending" sessions.</summary>
+    public int ReaperIntervalSeconds { get; set; } = 30;
+
+    public long MaxSegmentBytes => Math.Max(1, MaxSegmentMb) * 1024L * 1024L;
+}
+
 /// <summary>One plan in the "Plans" configuration section (keyed by plan code).</summary>
 public sealed class PlanConfig
 {

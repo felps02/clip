@@ -1210,7 +1210,10 @@ class JobRunner:
             sequence=live.sequence,
             final=live.final,
             post_roll=post_roll,
-            previous_duration=payload.previous.duration_seconds if payload.previous else None,
+            # the duration the previous job computed its hand-over point with: the API's,
+            # else (unknown to the API) the probed one, as that job did
+            previous_duration=(payload.previous.duration_seconds if payload.previous else None)
+            or previous_duration,
             committed_until=committed_until,
         )
         language, language_source = fixed_language(settings, context)
@@ -1631,13 +1634,38 @@ class JobRunner:
         self.api.complete(ctx.job_id, 0.0, None)
         ctx.progress.set(100, "Concluído")
 
+    def _render_failed(self, ctx: JobContext, error_text: str) -> None:
+        """Post a failed ``/render-result`` for the clip of a ``render_clip`` job (best
+        effort: the job's ``/fail`` follows; nothing once the job is cancelled)."""
+        clip = ctx.payload.clip
+        if clip is None or ctx.cancel.cancelled:
+            return
+        failed = RenderResultReport(
+            render_id=clip.render_id, status="failed", error=error_text[:500]
+        )
+        self._safe(lambda: self.api.render_result(ctx.job_id, failed))
+
     def _prepare_segments(
         self, ctx: JobContext
     ) -> tuple[Path, ProbeResult, Callable[[float], float]]:
         """Download the live segments of a ``render_clip`` and join them (concat demuxer,
         stream copy): ``(file, probe, session time -> file time)``. Each segment occupies
         its session duration in the joined file, so the clip's session times map onto it
-        through the segments' ``startOffsetSeconds``."""
+        through the segments' ``startOffsetSeconds``.
+
+        A segment only needs a duration, however short (the last one of a session is often
+        a sliver, which its ``live_segment`` job accepted too); the joined file needs more
+        than 0.5 s like any source, and the clip range is checked by the render. A segment
+        that is empty or unreadable fails the render for good: a failed ``/render-result``
+        (as for a failed join), then ``invalid_media``."""
+        try:
+            return self._join_segments(ctx)
+        except MediaError as exc:
+            self._render_failed(ctx, exc.message)
+            raise
+
+    def _join_segments(self, ctx: JobContext) -> tuple[Path, ProbeResult, Callable[[float], float]]:
+        """:meth:`_prepare_segments` without the failed ``/render-result``."""
         payload = ctx.payload
         segments = sorted(payload.segments, key=lambda s: s.start_offset_seconds)
         count = len(segments)
@@ -1655,7 +1683,12 @@ class JobRunner:
                 what=f"o segmento {index + 1} de {count} da live",
             )
             parts.append(dest)
-        probes = [self._probe(ctx, part) for part in parts]
+        probes: list[ProbeResult] = []
+        for index, part in enumerate(parts):
+            try:
+                probes.append(self._probe(ctx, part, min_duration=0.0))
+            except MediaError as exc:
+                raise MediaError(f"segmento {index + 1} de {count} da live: {exc.message}") from exc
         durations: list[float] = []
         for segment, part_probe in zip(segments, probes, strict=True):
             file_seconds = float(part_probe.duration or 0.0)
@@ -1681,13 +1714,8 @@ class JobRunner:
         except FfmpegNotFound, FfmpegTimeout:
             raise  # deployment problem / stuck process: retryable worker_error
         except FfmpegError as exc:
-            clip = payload.clip
             error_text = f"não foi possível juntar os segmentos da live: {exc}"[:500]
-            if clip is not None:
-                failed = RenderResultReport(
-                    render_id=clip.render_id, status="failed", error=error_text
-                )
-                self._safe(lambda: self.api.render_result(ctx.job_id, failed))
+            self._render_failed(ctx, error_text)
             raise RenderError(error_text) from exc
         finally:
             _discard_files(*parts)

@@ -98,3 +98,20 @@ Subscriptions), so the newest provider state must win:
   `NULL` (nothing reads them for older events).
 
 Down: drops the index and the four columns.
+
+## 20261023182826_LiveCapture
+
+Live capture (docs/LIVE_CAPTURE.md, docs/DATA_MODEL.md → companion_devices / live_sessions / live_segments):
+
+- `companion_devices`: the companion's devices; `token_hash` (SHA-256 hex, unique) and `token_prefix`, never the
+  token itself.
+- `live_sessions`: one per live capture, owning one project (`project_id` unique); partial unique index
+  `ix_live_sessions_device_active` on `device_id` where `status IN ('waiting','live','ending')` (at most one
+  non-terminal session per device) and `ix_live_sessions_open` on `(status, last_heartbeat_at)` for the reaper.
+- `live_segments`: one per uploaded segment, unique `(session_id, sequence)`, with its `live_segment` media asset
+  and job (both `ON DELETE SET NULL`) and the `live_context` its job reported.
+- `projects.source_platform` gains the value `obs` (text column: no schema change).
+
+New tables only: no existing row is read or changed, so it applies to a database that already has data.
+
+Down: drops the three tables.

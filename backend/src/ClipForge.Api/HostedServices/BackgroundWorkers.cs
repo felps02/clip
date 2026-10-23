@@ -1,4 +1,5 @@
 using ClipForge.Api.Features.Internal;
+using ClipForge.Api.Features.Live;
 using ClipForge.Api.Features.Media;
 using ClipForge.Api.Options;
 using ClipForge.Api.Services;
@@ -89,6 +90,22 @@ public sealed class JobReaper : PeriodicService
 
     protected override Task RunOnceAsync(IServiceProvider scope, CancellationToken ct)
         => scope.GetRequiredService<InternalJobService>().ReapExpiredLeasesAsync(ct);
+}
+
+/// <summary>Live sessions whose companion went silent (Live:SessionTimeoutMinutes) go to error; finished "ending" sessions end.</summary>
+public sealed class LiveSessionReaper : PeriodicService
+{
+    private readonly LiveOptions _options;
+
+    public LiveSessionReaper(IServiceProvider services, IOptions<LiveOptions> options, ILogger<LiveSessionReaper> logger) : base(services, logger)
+    {
+        _options = options.Value;
+    }
+
+    protected override TimeSpan Interval => TimeSpan.FromSeconds(Math.Max(5, _options.ReaperIntervalSeconds));
+
+    protected override Task RunOnceAsync(IServiceProvider scope, CancellationToken ct)
+        => scope.GetRequiredService<LiveService>().ReapAsync(ct);
 }
 
 /// <summary>Expired pending uploads and purge of soft-deleted projects/clips after the plan retention window.</summary>
@@ -254,6 +271,16 @@ public sealed class RetentionService
         var thumbKeys = await _db.Clips.Where(c => c.ProjectId == project.Id && c.ThumbnailStorageKey != null).Select(c => c.ThumbnailStorageKey!).ToListAsync(ct);
         foreach (var key in thumbKeys) await SafeDeleteAsync(key, ct);
 
+        // Live project: the session's segment files (users/{userId}/live/{sessionId}/); their rows go with the project
+        // (live_sessions and live_segments cascade), the segment assets right after it.
+        var liveSessionIds = await _db.LiveSessions.Where(s => s.ProjectId == project.Id).Select(s => s.Id).ToListAsync(ct);
+        foreach (var sessionId in liveSessionIds)
+        {
+            await SafeDeletePrefixAsync($"{StorageKeys.UserPrefix(project.UserId)}live/{sessionId:D}/", ct);
+        }
+        var segmentAssetIds = await _db.LiveSegments.Where(s => liveSessionIds.Contains(s.SessionId) && s.MediaAssetId != null)
+            .Select(s => s.MediaAssetId!.Value).ToListAsync(ct);
+
         // The source asset may have been reused by another project after this one was soft-deleted (the API allows
         // it): it is only purged together with the last project that references it, otherwise the live project would
         // silently lose its source (projects.media_asset_id is ON DELETE SET NULL).
@@ -273,6 +300,10 @@ public sealed class RetentionService
         if (asset is not null && !assetStillUsed)
         {
             await _db.MediaAssets.Where(m => m.Id == asset.Id).ExecuteDeleteAsync(ct);
+        }
+        if (segmentAssetIds.Count > 0)
+        {
+            await _db.MediaAssets.Where(m => segmentAssetIds.Contains(m.Id)).ExecuteDeleteAsync(ct);
         }
         else if (asset is not null)
         {

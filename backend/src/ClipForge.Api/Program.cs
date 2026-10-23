@@ -10,6 +10,7 @@ using ClipForge.Api.Features.Dashboard;
 using ClipForge.Api.Features.Health;
 using ClipForge.Api.Features.Internal;
 using ClipForge.Api.Features.Jobs;
+using ClipForge.Api.Features.Live;
 using ClipForge.Api.Features.Media;
 using ClipForge.Api.Features.Notifications;
 using ClipForge.Api.Features.Plans;
@@ -59,6 +60,7 @@ builder.Services.Configure<RateLimitingOptions>(configuration.GetSection(RateLim
 builder.Services.Configure<MediaOptions>(configuration.GetSection(MediaOptions.SectionName));
 builder.Services.Configure<ReverseProxyOptions>(configuration.GetSection(ReverseProxyOptions.SectionName));
 builder.Services.Configure<AssistantOptions>(configuration.GetSection(AssistantOptions.SectionName));
+builder.Services.Configure<LiveOptions>(configuration.GetSection(LiveOptions.SectionName));
 
 var authOptions = configuration.GetSection(AuthOptions.SectionName).Get<AuthOptions>() ?? new AuthOptions();
 var internalOptions = configuration.GetSection(InternalOptions.SectionName).Get<InternalOptions>() ?? new InternalOptions();
@@ -117,6 +119,12 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         {
             OnMessageReceived = context =>
             {
+                // A companion device token is not a JWT: the Device scheme handles it, and user endpoints refuse it (401).
+                if (DeviceTokens.FromAuthorizationHeader(context.Request.Headers.Authorization.ToString()) is not null)
+                {
+                    context.NoResult();
+                    return Task.CompletedTask;
+                }
                 if (string.IsNullOrEmpty(context.Token) && !context.Request.Headers.ContainsKey("Authorization")
                     && context.Request.Cookies.TryGetValue(AuthOptions.AccessCookieName, out var cookie) && !string.IsNullOrEmpty(cookie))
                 {
@@ -132,7 +140,8 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             OnForbidden = context => Problems.WriteAsync(context.HttpContext, 403, ErrorCodes.Forbidden, "Acesso negado."),
         };
     })
-    .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, InternalApiKeyAuthenticationHandler>(InternalApiKeyAuthenticationHandler.SchemeName, _ => { });
+    .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, InternalApiKeyAuthenticationHandler>(InternalApiKeyAuthenticationHandler.SchemeName, _ => { })
+    .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, DeviceTokenAuthenticationHandler>(DeviceTokenAuthenticationHandler.SchemeName, _ => { });
 
 builder.Services.AddAuthorization(options =>
 {
@@ -140,6 +149,11 @@ builder.Services.AddAuthorization(options =>
         .AddAuthenticationSchemes(InternalApiKeyAuthenticationHandler.SchemeName)
         .RequireAuthenticatedUser()
         .RequireClaim("scope", "internal"));
+    // Companion endpoints: only a device token (never the user's cookie or JWT).
+    options.AddPolicy(DeviceTokenAuthenticationHandler.PolicyName, policy => policy
+        .AddAuthenticationSchemes(DeviceTokenAuthenticationHandler.SchemeName)
+        .RequireAuthenticatedUser()
+        .RequireClaim(DeviceTokenAuthenticationHandler.DeviceIdClaim));
 });
 
 // ---------------------------------------------------------------- CORS (credentials)
@@ -211,6 +225,8 @@ builder.Services.AddScoped<ProjectService>();
 builder.Services.AddScoped<ClipsArchiveService>();
 builder.Services.AddScoped<ClipService>();
 builder.Services.AddScoped<InternalJobService>();
+builder.Services.AddScoped<LiveJobSupport>();
+builder.Services.AddScoped<LiveService>();
 builder.Services.AddScoped<WebhookService>();
 builder.Services.AddScoped<RetentionService>();
 builder.Services.AddScoped<UploadTargetGuard>();
@@ -239,6 +255,7 @@ builder.Services.AddScoped<AssistantService>();
 // ---------------------------------------------------------------- hosted services
 builder.Services.AddHostedService<PlanSeeder>();
 builder.Services.AddHostedService<JobReaper>();
+builder.Services.AddHostedService<LiveSessionReaper>();
 builder.Services.AddHostedService<RetentionCleanup>();
 builder.Services.AddHostedService<AccountPurge>();
 builder.Services.AddHostedService<EmailDispatcher>();
@@ -332,6 +349,7 @@ app.MapPlansEndpoints();
 app.MapBillingEndpoints();
 app.MapWebhooksEndpoints();
 app.MapAssistantEndpoints();
+app.MapLiveEndpoints();
 app.MapInternalEndpoints();
 
 await app.RunAsync();

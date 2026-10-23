@@ -34,6 +34,9 @@ public class AppDbContext : IdentityUserContext<AppUser, Guid>
     public DbSet<ClipRender> ClipRenders => Set<ClipRender>();
     public DbSet<IntegrationConnection> IntegrationConnections => Set<IntegrationConnection>();
     public DbSet<Notification> Notifications => Set<Notification>();
+    public DbSet<CompanionDevice> CompanionDevices => Set<CompanionDevice>();
+    public DbSet<LiveSession> LiveSessions => Set<LiveSession>();
+    public DbSet<LiveSegment> LiveSegments => Set<LiveSegment>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
@@ -60,6 +63,7 @@ public class AppDbContext : IdentityUserContext<AppUser, Guid>
         ConfigureProjectsAndJobs(builder);
         ConfigureClips(builder);
         ConfigureMisc(builder);
+        ConfigureLive(builder);
     }
 
     private static void ConfigureIdentity(ModelBuilder builder)
@@ -321,6 +325,59 @@ public class AppDbContext : IdentityUserContext<AppUser, Guid>
             e.Property(n => n.Data).HasRawJson();
             e.HasIndex(n => new { n.UserId, n.ReadAt, n.CreatedAt }).IsDescending(false, false, true);
             e.HasOne<AppUser>().WithMany().HasForeignKey(n => n.UserId).OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
+    /// <summary>Live capture (docs/LIVE_CAPTURE.md, docs/DATA_MODEL.md "companion_devices / live_sessions / live_segments").</summary>
+    private static void ConfigureLive(ModelBuilder builder)
+    {
+        builder.Entity<CompanionDevice>(e =>
+        {
+            e.ToTable("companion_devices");
+            e.HasKey(d => d.Id);
+            e.Property(d => d.Name).HasMaxLength(60).IsRequired();
+            e.Property(d => d.TokenHash).HasMaxLength(64).IsRequired();
+            e.Property(d => d.TokenPrefix).HasMaxLength(16).IsRequired();
+            e.HasIndex(d => d.TokenHash).IsUnique();
+            e.HasIndex(d => new { d.UserId, d.CreatedAt });
+            e.HasOne<AppUser>().WithMany().HasForeignKey(d => d.UserId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        var nonTerminal = "status IN (" + string.Join(", ", LiveSession.NonTerminalStatuses.Select(s => "'" + EnumNames.ToSnake(s) + "'")) + ")";
+        builder.Entity<LiveSession>(e =>
+        {
+            e.ToTable("live_sessions");
+            e.HasKey(s => s.Id);
+            e.Property(s => s.Settings).HasJsonConversion();
+            e.Property(s => s.CompanionState).HasJsonConversion();
+            e.Property(s => s.Obs).HasJsonConversion();
+            e.Property(s => s.EndReason).HasMaxLength(500);
+            e.HasIndex(s => new { s.UserId, s.StartedAt }).IsDescending(false, true);
+            e.HasIndex(s => s.ProjectId).IsUnique();
+            // At most one waiting/live/ending session per device.
+            e.HasIndex(s => s.DeviceId).IsUnique().HasFilter(nonTerminal).HasDatabaseName("ix_live_sessions_device_active");
+            e.HasIndex(s => new { s.Status, s.LastHeartbeatAt }).HasFilter(nonTerminal).HasDatabaseName("ix_live_sessions_open");
+            e.HasOne(s => s.Device).WithMany().HasForeignKey(s => s.DeviceId).OnDelete(DeleteBehavior.Cascade);
+            e.HasOne(s => s.Project).WithMany().HasForeignKey(s => s.ProjectId).OnDelete(DeleteBehavior.Cascade);
+            e.HasOne<AppUser>().WithMany().HasForeignKey(s => s.UserId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        builder.Entity<LiveSegment>(e =>
+        {
+            e.ToTable("live_segments");
+            e.HasKey(s => s.Id);
+            e.Property(s => s.StartOffsetSeconds).HasPrecision(12, 3);
+            e.Property(s => s.DurationSeconds).HasPrecision(12, 3);
+            e.Property(s => s.Error).HasMaxLength(2000);
+            e.Property(s => s.LiveContext).HasRawJson();
+            e.HasIndex(s => new { s.SessionId, s.Sequence }).IsUnique();
+            e.HasIndex(s => s.JobId);
+            e.HasIndex(s => s.MediaAssetId);
+            e.HasIndex(s => s.UserId);
+            e.HasOne(s => s.Session).WithMany().HasForeignKey(s => s.SessionId).OnDelete(DeleteBehavior.Cascade);
+            e.HasOne(s => s.MediaAsset).WithMany().HasForeignKey(s => s.MediaAssetId).OnDelete(DeleteBehavior.SetNull);
+            e.HasOne<ProcessingJob>().WithMany().HasForeignKey(s => s.JobId).OnDelete(DeleteBehavior.SetNull);
+            e.HasOne<AppUser>().WithMany().HasForeignKey(s => s.UserId).OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

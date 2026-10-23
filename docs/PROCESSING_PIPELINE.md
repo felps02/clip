@@ -520,10 +520,18 @@ previous segment failed; `context` is the `liveContext` the previous segment's j
      candidates, chosen after the merge and the near-duplicate suppression (which see every
      peak of the window), before the ranking and the `maxCandidates` cut;
    - **edges**: a second on an edge of the window is never a peak, except at the start of
-     the session (segment 0) and at its end (final segment). The composite of a moment just
-     before the window decays into its first second: as a peak, that artefact would
-     suppress the real peak a few seconds later, which the previous window leaves to this
-     one — the moment would be lost (tested);
+     the session (segment 0, or a window whose tail reaches back to the session's first
+     second) and at its end (final segment). The composite of a moment just before the
+     window decays into its first second: as a peak, that artefact would suppress the real
+     peak a few seconds later, which the previous window leaves to this one — the moment
+     would be lost (tested). Such an edge does not bound the clip windows either while the
+     merge and the near-duplicate suppression compare them: a clip reaching beyond it keeps
+     the place it has in the recording instead of being pushed inside the window, where it
+     could reach (and swallow, keeping its own peak) the clip of a neighbouring moment that
+     the whole recording keeps apart, and the window owning that moment would lose it
+     (tested at both edges; with the default `minClipSeconds` 15 this happened next to the
+     hand-over points of 60 s segments too). The clips reported are cut from the window's
+     media as before (one reported unmerged is exactly the window computed inside it);
    - **score** = `round(100 · (0.5·pctSession + 0.5·sigmoid(peak − threshold)))`, where
      `pctSession` is the percentile of the peak (composite without focus) among
      `context.compositeSample` plus the window's own composite;
@@ -561,41 +569,62 @@ previous segment failed; `context` is the `liveContext` the previous segment's j
 
 ### Commit rule
 
-`postRoll = clamp(maxClipSeconds / 2, 8, 30)`. Segment N reports the candidates whose peak
-lies in `[start_N − postRoll, end_N − postRoll)`; segment 0 from the start of the session;
-the final segment up to its end (`end_N` included, whatever the file's exact length). The
-moments after `end_N − postRoll` need media segment N does not have yet: segment N+1 detects
-them again with segment N's tail as context. The ranges of consecutive segments meet at the
-**hand-over point** `end_N − min(postRoll, duration_N)`, so every peak belongs to exactly
-one segment:
+`postRoll = clamp(maxClipSeconds / 2, 8, 30)`. Consecutive segments meet at the
+**hand-over point** of the earlier one: segment N reports the candidates whose peak lies in
+`[handover_{N−1}, handover_N)`, segment 0 from the start of the session, the final segment
+up to its end (`end_N` included, whatever the file's exact length), so every peak belongs to
+exactly one segment. With `origin_{N+1} = ceil(end_N − min(45, duration_N))`, the first whole
+second of the next window (step 4):
 
-- a segment shorter than `postRoll` (the last piece of an OBS file split, a short final
-  run) hands over at its own start: the next window's tail is that whole segment and
-  cannot see further back, so `[end_N − postRoll, start_N)` would otherwise be seen by
-  nobody (tested: a 6 s segment with `postRoll` 10 s reports the moment at 57.5 s that the
-  literal rule would lose);
+```
+handover_N = max(end_N − min(postRoll, duration_N), min(end_N − 1, origin_{N+1} + 8))
+```
+
+- `end_N − postRoll`: the moments after it need media segment N does not have yet, and
+  segment N+1 detects them again with segment N's tail as context. It is the hand-over
+  point of every segment of `postRoll` + 9 s or more: the next window already starts at
+  least 8 s before it (more than 14 s before it for segments of 45 s or more);
+- **never before the next window's first whole second + 8 s** (`HANDOVER_CONTEXT`): that
+  second is never a peak (edges, step 4), and a moment rising right after the window's
+  origin would be decided without its beginning (rolling baselines, smoothing, the clip's
+  start). A segment shorter than about `postRoll` + 2 s — `segmentSeconds` 20–31 with the
+  default `maxClipSeconds` 60, the last piece of an OBS file split, a short segment 0 —
+  would otherwise hand over at (or right after) that origin, and the moments there were
+  reported by nobody: every boundary of 20 s or 30 s segments with `postRoll` 30 lost the
+  moment of its first second, and the e2e fixture cut every ~21 s lost its moment at
+  45.5 s (tested, the latter through the worker). 20 s segments with `postRoll` 30 hand
+  over at `ceil(start) + 8`;
+- **never after `end_N − 1`**: the last second of segment N's window is never a peak
+  either (a 6 s segment with `postRoll` 10 hands over 1 s before its end; a segment shorter
+  than 1 s at its own start);
 - segment N writes its hand-over point into `liveContext.committedUntil` (`null` for the
   final segment) and segment N+1 starts its range there when the context is the one of
   `sequence − 1` (`context.sequence`), so both sides of a boundary use the very same number
   even if the durations the API holds are not exactly contiguous or the settings changed
   between the two jobs; without it (an API that does not pass the extras back), or when it
   cannot be the predecessor's hand-over point (more than 30 s + 2 s before the segment's
-  start, or after it), N+1 computes `start_{N+1} − min(postRoll,
-  previous.durationSeconds)` from the API's durations;
+  start, or after it), N+1 recomputes the predecessor's hand-over point with the formula
+  above from `previous.durationSeconds` (the probed duration of the previous segment when
+  the API does not know it, as that job did; `start_{N+1} − postRoll` without any);
 - both windows see a moment near a hand-over point and both apply the same rule on the
   same session grid: the one whose range holds the peak reports it, the other leaves it.
 
 Tests (`tests/test_live.py`) run synthetic session composites through the real fusion,
-segment by segment (windows planned as the worker plans them): every planted moment is
-reported exactly once and by the expected segment, including peaks just before and on a
-hand-over point, in a segment's last second, in the first second of the session, in the
-last second of the final segment, and after a segment shorter than the post-roll. Known
-limits: two *different* moments closer than `minClipSeconds` on the two sides of a
-hand-over point may both be reported (each window sees only one of them in full, where a
-batch analysis keeps the stronger); a peak on the very first second of the window that
-follows a segment shorter than `postRoll` is not reported; a previous segment that failed
-takes its own range with it (`previous: null`; the next segment starts on its own first
-whole second).
+segment by segment (windows planned as the worker plans them), with and without
+`committedUntil`: every planted moment is reported exactly once and by the expected segment,
+including peaks just before and on a hand-over point, in a segment's last second, in the
+first second of the session, in the last second of the final segment, on every boundary of
+20 s and 30 s segments with `postRoll` 30 (whole and fractional cuts), after a segment
+shorter than the post-roll, after a segment 0 of 5 s and of 1.2 s, next to both edges of a
+window, and in about 50 seeded random sessions (segments of 2.5 s or more, all clip
+settings). Known limits: two *different* moments closer than `minClipSeconds` on the two
+sides of a hand-over point may both be reported (each window sees only one of them in full,
+where a batch analysis keeps the stronger); a segment shorter than about 2.5 s that is not
+the final one (the tail of an OBS file split) can lose a moment peaking in the second or two
+around its end: the next window's context is only that short segment, so those seconds lie
+on an edge of every window that sees them (the payload carries a single previous segment); a
+previous segment that failed takes its own range with it (`previous: null`; the next segment
+starts on its own first whole second).
 
 ### `liveContext` (summary of `/analysis` and `/complete`)
 
@@ -631,7 +660,12 @@ segment that starts at or before it (`file time = that segment's place in the fi
 (t − its startOffsetSeconds)`; a time in a gap between two segments is held at the end of
 the earlier one). The transcript of a live clip (`analysis.transcriptUrl`, a
 `live_segment`'s `transcript.json`) is in session times and its words are mapped the same
-way for the captions. A join that fails posts a failed `/render-result` and fails the job
+way for the captions. A segment only needs a positive duration, however short (the last
+segment of a session is often a sliver of a fraction of a second, which its `live_segment`
+job accepted too); the joined file needs more than 0.5 s like any source, and the clip range
+is checked by the render. A segment that is empty, unreadable by ffprobe or without a
+duration posts a failed `/render-result` ("segmento 2 de 3 da live: …") and fails the job
+`invalid_media`; a join that fails posts a failed `/render-result` and fails the job
 `render_failed`; a segment that cannot be downloaded is `transfer_failed` (retryable). A
 `render_clip` with `source` (an uploaded video) is unchanged.
 

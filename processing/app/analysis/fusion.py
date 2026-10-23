@@ -17,7 +17,10 @@ priority; the stored score stays the unmodified internal estimate (:class:`Focus
 A live window (``live_segment``) reports only the peaks of its :class:`PeakScope` (the
 commit rule) and scores them against the session's composite sample as well as its own
 (``score_reference``); its edges are not the recording's, so a second on an edge is never
-a peak there (the true maximum may lie outside the window).
+a peak there (the true maximum may lie outside the window), and such an edge does not bound
+the clip windows while the merge and the suppression decide (pushed inside the window, the
+clip of a moment next to the edge could swallow its neighbour, which the whole recording
+keeps apart); the reported windows are then brought back inside the window's media.
 
 Pure numpy functions, so the behaviour can be unit-tested on synthetic series.
 """
@@ -405,6 +408,27 @@ def pick_peaks(
     return sorted(kept)
 
 
+def _bound_window(
+    start: float, end: float, peak: int, max_clip: float, low: float, high: float
+) -> tuple[float, float]:
+    """Keep ``[start, end]`` inside ``[low, high]`` — moved rather than shortened while it
+    fits — and no longer than ``max_clip`` (cut around the peak)."""
+    if start < low:
+        end += low - start
+        start = low
+    if end > high:
+        start -= end - high
+        end = high
+        start = max(low, start)
+    if end - start > max_clip:
+        start = max(start, peak + 0.5 - max_clip * 0.4)
+        end = start + max_clip
+        if end > high:
+            end = high
+            start = max(low, end - max_clip)
+    return float(start), float(end)
+
+
 def expand_window(
     composite: np.ndarray,
     peak: int,
@@ -414,8 +438,13 @@ def expand_window(
     *,
     pre_roll: float = PRE_ROLL,
     post_roll: float = POST_ROLL,
+    bounds: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
-    """Grow from the peak while composite > threshold/2, apply pre/post roll and bounds."""
+    """Grow from the peak while composite > threshold/2, apply pre/post roll and bounds.
+
+    ``bounds`` (default ``(0, duration)``) is where the window must fit; a live window
+    passes an infinite bound for an edge that is not the recording's (see
+    :func:`detect_candidates`)."""
     n = len(composite)
     half = threshold / 2.0
     min_clip, max_clip = settings.min_clip, settings.max_clip
@@ -432,20 +461,8 @@ def expand_window(
         deficit = min_clip - (end - start)
         start -= deficit * 0.4
         end += deficit * 0.6
-    if start < 0:
-        end += -start
-        start = 0.0
-    if end > duration:
-        start -= end - duration
-        end = duration
-        start = max(0.0, start)
-    if end - start > max_clip:
-        start = max(start, peak + 0.5 - max_clip * 0.4)
-        end = start + max_clip
-        if end > duration:
-            end = duration
-            start = max(0.0, end - max_clip)
-    return float(start), float(end)
+    low, high = bounds if bounds is not None else (0.0, float(duration))
+    return _bound_window(start, end, peak, max_clip, low, high)
 
 
 def snap_window(
@@ -458,8 +475,10 @@ def snap_window(
     settings: FusionSettings,
     duration: float,
     tolerance: float = SNAP_TOLERANCE,
+    bounds: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
-    """Move start/end to the nearest anchor (silence / transcript boundary) within ±tolerance."""
+    """Move start/end to the nearest anchor (silence / transcript boundary) within ±tolerance;
+    the result is clipped to ``bounds`` (default ``(0, duration)``)."""
     peak_time = peak + 0.5
 
     def nearest(anchors: np.ndarray, value: float) -> float | None:
@@ -485,9 +504,28 @@ def snap_window(
         and settings.min_clip <= new_end - start <= settings.max_clip
     ):
         end = new_end
-    start = max(0.0, start)
-    end = min(float(duration), end)
+    low, high = bounds if bounds is not None else (0.0, float(duration))
+    start = max(low, start)
+    end = min(high, end)
     return start, end
+
+
+def _within_media(
+    window: Window, computed: tuple[Window, Window], settings: FusionSettings, duration: float
+) -> Window:
+    """A window the merge and the suppression kept, inside the media of the analysis:
+    ``computed`` is its peak's window as they compared it and as computed inside the media;
+    the latter when the window is that very one (not merged), else the window moved inside
+    ``[0, duration]``."""
+    decision, bounded = computed
+    if (window.start, window.end) == (decision.start, decision.end):
+        return bounded
+    if window.start >= 0.0 and window.end <= duration:
+        return window
+    start, end = _bound_window(
+        window.start, window.end, window.peak, settings.max_clip, 0.0, float(duration)
+    )
+    return Window(start, end, window.peak, window.value)
 
 
 def merge_windows(
@@ -716,9 +754,10 @@ def detect_candidates(
     start_anchors = np.array(sorted({e for _, e in silences} | set(boundaries)), dtype=np.float64)
     end_anchors = np.array(sorted({s for s, _ in silences} | set(boundaries)), dtype=np.float64)
 
-    windows: list[Window] = []
-    for peak in peaks:
-        start, end = expand_window(composite, peak, threshold, settings, float(duration))
+    def peak_window(peak: int, bounds: tuple[float, float]) -> Window:
+        start, end = expand_window(
+            composite, peak, threshold, settings, float(duration), bounds=bounds
+        )
         start, end = snap_window(
             start,
             end,
@@ -727,18 +766,43 @@ def detect_candidates(
             end_anchors=end_anchors,
             settings=settings,
             duration=float(duration),
+            bounds=bounds,
         )
         if end - start < min(settings.min_clip, float(duration)) - 1e-6:
             # recording shorter than the minimum clip: use what exists
             start, end = 0.0, float(duration)
-        windows.append(Window(start, end, peak, float(composite[peak])))
+        return Window(start, end, peak, float(composite[peak]))
+
+    # An edge of a live window that is not the recording's does not bound the clip windows
+    # the merge and the suppression compare: pushed inside the window, the clip of a moment
+    # next to that edge could reach (and swallow) a neighbour that the whole recording keeps
+    # apart, and the window owning the neighbour would lose it. A window reported as is
+    # keeps the one computed inside the media; a merged one is brought back inside.
+    media = (0.0, float(duration))
+    decision_bounds = (
+        0.0 if scope is None or scope.left_edge else -math.inf,
+        float(duration) if scope is None or scope.right_edge else math.inf,
+    )
+    windows: list[Window] = []
+    inside: dict[int, tuple[Window, Window]] = {}  # peak -> (decision window, media window)
+    for peak in peaks:
+        decision = peak_window(peak, decision_bounds)
+        inside[peak] = (
+            decision,
+            decision if decision_bounds == media else peak_window(peak, media),
+        )
+        windows.append(decision)
 
     windows = merge_windows(windows, settings)
     windows = non_max_suppression(windows)
     windows.sort(key=lambda w: (-w.value, w.start))
     if scope is not None:
         # the commit rule: a live window reports the moments whose peak is its own
-        windows = [w for w in windows if scope.contains(w.peak + 0.5)]
+        windows = [
+            _within_media(w, inside[w.peak], settings, float(duration))
+            for w in windows
+            if scope.contains(w.peak + 0.5)
+        ]
     whole_video = False
     if not windows and settings.short_source and has_any_signal(audio, transcript, visual):
         # a source shorter than the minimum clip with no moment above the threshold: the

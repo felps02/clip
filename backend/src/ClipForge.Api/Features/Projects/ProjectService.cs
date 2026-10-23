@@ -1,3 +1,4 @@
+using ClipForge.Api.Features.Live;
 using ClipForge.Api.Features.Sources;
 using ClipForge.Api.Options;
 using ClipForge.Api.Services;
@@ -28,6 +29,7 @@ public sealed class ProjectService
     private readonly RenderService _renders;
     private readonly IClock _clock;
     private readonly JobsOptions _jobs;
+    private readonly LiveJobSupport _live;
     private readonly ILogger<ProjectService> _logger;
 
     public ProjectService(
@@ -40,8 +42,10 @@ public sealed class ProjectService
         RenderService renders,
         IClock clock,
         IOptions<JobsOptions> jobs,
+        LiveJobSupport live,
         ILogger<ProjectService> logger)
     {
+        _live = live;
         _db = db;
         _quotas = quotas;
         _subscriptions = subscriptions;
@@ -243,7 +247,7 @@ public sealed class ProjectService
     public async Task<ProjectSummaryDto> ToSummaryAsync(Project project, CancellationToken ct)
     {
         var latestJob = await _db.ProcessingJobs.Where(j => j.ProjectId == project.Id).OrderByDescending(j => j.CreatedAt).FirstOrDefaultAsync(ct);
-        var candidateCount = await CandidateCountAsync(project.Id, ct);
+        var candidateCount = await CandidateCountAsync(project, ct);
         var clipCount = await _db.Clips.CountAsync(c => c.ProjectId == project.Id && c.DeletedAt == null, ct);
         var thumbnailKey = await _db.Clips.Where(c => c.ProjectId == project.Id && c.DeletedAt == null && c.ThumbnailStorageKey != null)
             .OrderByDescending(c => c.CreatedAt).Select(c => c.ThumbnailStorageKey).FirstOrDefaultAsync(ct);
@@ -255,16 +259,18 @@ public sealed class ProjectService
     {
         var project = await GetOwnedAsync(userId, projectId, ct, includeAsset: true);
         var jobs = await _db.ProcessingJobs.Where(j => j.ProjectId == project.Id).OrderByDescending(j => j.CreatedAt).ToListAsync(ct);
-        var candidateCount = await CandidateCountAsync(project.Id, ct);
+        var candidateCount = await CandidateCountAsync(project, ct);
         var clipCount = await _db.Clips.CountAsync(c => c.ProjectId == project.Id && c.DeletedAt == null, ct);
         var asset = project.MediaAsset;
         var source = new ProjectSourceDto(asset?.ToDto(), asset?.IsPreviewable == true, asset?.IsPreviewable == true ? await _urls.PreviewAsync(asset, ct) : null);
         return new ProjectDetailResponse(project.ToDto(), jobs.Select(j => j.ToSummary(project.Title)).ToList(), candidateCount, clipCount, source);
     }
 
-    private async Task<int> CandidateCountAsync(Guid projectId, CancellationToken ct)
+    /// <summary>Candidates of the latest analysis; for a live project, those of every segment (each reports its own range).</summary>
+    private async Task<int> CandidateCountAsync(Project project, CancellationToken ct)
     {
-        var jobId = await LatestCandidateJobIdAsync(projectId, ct);
+        if (project.SourceKind == SourceKind.Live) return await _db.ClipCandidates.CountAsync(c => c.ProjectId == project.Id, ct);
+        var jobId = await LatestCandidateJobIdAsync(project.Id, ct);
         return jobId is null ? 0 : await _db.ClipCandidates.CountAsync(c => c.JobId == jobId, ct);
     }
 
@@ -284,6 +290,15 @@ public sealed class ProjectService
     {
         var project = await GetOwnedAsync(userId, projectId, ct);
         var now = _clock.UtcNow;
+        if (project.SourceKind == SourceKind.Live)
+        {
+            // The live session of a deleted project stops: the companion's next call answers 409.
+            var sessions = await _db.LiveSessions.Where(s => s.ProjectId == project.Id && LiveSession.NonTerminalStatuses.Contains(s.Status)).ToListAsync(ct);
+            foreach (var session in sessions)
+            {
+                await _live.SetSessionErrorAsync(session, LiveService.ProjectDeletedReason, ct);
+            }
+        }
         project.DeletedAt = now;
         project.UpdatedAt = now;
         await _db.Clips.Where(c => c.ProjectId == project.Id && c.DeletedAt == null)
@@ -298,6 +313,7 @@ public sealed class ProjectService
                 job.Status = JobStatus.Cancelled;
                 job.FinishedAt = now;
                 job.ReservedSeconds = 0;
+                await _live.OnJobStatusChangedAsync(job, ct);
             }
             else
             {
@@ -371,6 +387,7 @@ public sealed class ProjectService
             job.StatusMessage = "Cancelado";
             job.UpdatedAt = now;
             await UpdateProjectStatusAfterJobAsync(job, ct);
+            await _live.OnJobStatusChangedAsync(job, ct);
         }
         else if (JobStateMachine.CanRequestCancel(job.Status))
         {
@@ -422,7 +439,10 @@ public sealed class ProjectService
             return new CandidatesResponse([], new CandidatesSignalsDto(new(false), new(false), new(false)));
         }
 
-        var query = _db.ClipCandidates.Where(c => c.JobId == jobId);
+        // A live project's moments come from every segment job (the commit rule makes their ranges disjoint).
+        var query = project.SourceKind == SourceKind.Live
+            ? _db.ClipCandidates.Where(c => c.ProjectId == project.Id)
+            : _db.ClipCandidates.Where(c => c.JobId == jobId);
         if (!string.IsNullOrWhiteSpace(category) && EnumNames.TryParse<ClipCategory>(category, out var cat))
         {
             query = query.Where(c => c.Category == cat);
@@ -467,7 +487,14 @@ public sealed class ProjectService
     public async Task<(Clip Clip, ProcessingJob Job)> CreateClipFromCandidateAsync(Guid userId, Guid projectId, Guid candidateId, CreateClipFromCandidateRequest request, CancellationToken ct)
     {
         var project = await GetOwnedAsync(userId, projectId, ct, includeAsset: true);
-        if (project.MediaAsset is not { IsUsable: true })
+        if (project.SourceKind == SourceKind.Live)
+        {
+            if (!await _live.HasUsableSegmentsAsync(project.Id, ct))
+            {
+                throw AppException.InvalidMedia("Os segmentos desta live não estão mais disponíveis para renderizar.");
+            }
+        }
+        else if (project.MediaAsset is not { IsUsable: true })
         {
             throw AppException.InvalidMedia("O projeto não possui um arquivo válido para renderizar.");
         }
@@ -479,7 +506,7 @@ public sealed class ProjectService
         var start = request.StartSeconds ?? candidate.StartSeconds;
         var end = request.EndSeconds ?? candidate.EndSeconds;
         if (end <= start) throw AppException.Validation("endSeconds deve ser maior que startSeconds.");
-        if (project.MediaAsset.DurationSeconds is { } duration && end > duration + 1)
+        if (project.MediaAsset?.DurationSeconds is { } duration && end > duration + 1)
         {
             throw AppException.Validation("O trecho ultrapassa a duração do vídeo.");
         }

@@ -61,8 +61,13 @@ public sealed class QuotaService
         var activeProjects = await _db.Projects
             .CountAsync(p => p.UserId == userId && p.DeletedAt == null && ActiveProjectStatuses.Contains(p.Status), ct);
 
+        // A live session takes one concurrency slot while it is open or still has segments to analyse (its segment jobs
+        // run one at a time, in order), instead of one per queued segment.
         var activeJobs = await _db.ProcessingJobs
-            .CountAsync(j => j.UserId == userId && JobStateMachine.ActiveStatuses.Contains(j.Status), ct);
+            .CountAsync(j => j.UserId == userId && JobStateMachine.ActiveStatuses.Contains(j.Status) && j.Kind != JobKind.LiveSegment, ct);
+        activeJobs += await _db.LiveSessions
+            .CountAsync(s => s.UserId == userId && (LiveSession.NonTerminalStatuses.Contains(s.Status)
+                || _db.ProcessingJobs.Any(j => j.ProjectId == s.ProjectId && j.Kind == JobKind.LiveSegment && JobStateMachine.ActiveStatuses.Contains(j.Status))), ct);
 
         return new UsageSnapshot(entitlement, processing, reserved, (int)renders, storage, activeProjects, activeJobs);
     }

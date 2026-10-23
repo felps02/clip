@@ -32,7 +32,8 @@ public sealed record UploadFileRequest(string Kind, string FileName, string? Con
 
 public sealed record UploadUrlsRequest(List<UploadFileRequest> Files);
 
-public sealed record AnalysisSummaryInput(JsonElement? Signals, WebcamRegion? WebcamRegion, string? Language, decimal? ProcessedSeconds, int? CandidatesFound, int? ClipsRendered);
+/// <summary><c>liveContext</c> (live_segment only) is stored on the segment and becomes the next segment's <c>context</c>.</summary>
+public sealed record AnalysisSummaryInput(JsonElement? Signals, WebcamRegion? WebcamRegion, string? Language, decimal? ProcessedSeconds, int? CandidatesFound, int? ClipsRendered, JsonElement? LiveContext = null);
 
 public sealed record AnalysisRequest(string? TranscriptKey, string? SignalsKey, AnalysisSummaryInput? Summary);
 
@@ -117,6 +118,43 @@ public sealed record RenderJobPayload(
     Guid ProjectId,
     int LeaseSeconds,
     JobPayloadSource Source,
+    RenderClipInfo Clip,
+    RenderAnalysisInfo Analysis,
+    RenderPayloadLimits Limits);
+
+// ---------------------------------------------------------------- live capture (docs/LIVE_CAPTURE.md §3)
+
+/// <summary><c>live</c> of a live_segment payload: where the segment sits in the session.</summary>
+public sealed record LivePayloadInfo(Guid SessionId, Guid SegmentId, int Sequence, decimal StartOffsetSeconds, decimal DurationSeconds, bool Final, int SegmentSeconds);
+
+/// <summary><c>previous</c> of a live_segment payload: the segment sequence − 1 (null for sequence 0 or when it failed).</summary>
+public sealed record LivePreviousInfo(Guid SegmentId, int Sequence, string DownloadUrl, decimal StartOffsetSeconds, decimal DurationSeconds, string FileName, string ContentType, long SizeBytes);
+
+public sealed record LiveSegmentJobPayload(
+    Guid JobId,
+    JobKind Kind,
+    int Attempt,
+    Guid UserId,
+    Guid ProjectId,
+    int LeaseSeconds,
+    JobPayloadSource Source,
+    AnalysisSettings Settings,
+    AnalyzePayloadLimits Limits,
+    LivePayloadInfo Live,
+    LivePreviousInfo? Previous,
+    JsonElement? Context);
+
+/// <summary>One recorded segment of a render_clip payload of a live project (instead of a single <c>source</c>).</summary>
+public sealed record LiveSegmentSourceDto(string DownloadUrl, decimal StartOffsetSeconds, decimal DurationSeconds, string FileName, string ContentType, long SizeBytes);
+
+public sealed record LiveRenderJobPayload(
+    Guid JobId,
+    JobKind Kind,
+    int Attempt,
+    Guid UserId,
+    Guid ProjectId,
+    int LeaseSeconds,
+    IReadOnlyList<LiveSegmentSourceDto> Segments,
     RenderClipInfo Clip,
     RenderAnalysisInfo Analysis,
     RenderPayloadLimits Limits);

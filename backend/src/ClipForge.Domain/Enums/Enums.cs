@@ -20,7 +20,7 @@ public enum MediaAssetStatus { Pending, Uploaded, Verified, Failed, Deleted }
 
 public enum SourceKind { Upload, Link, Live }
 
-public enum SourcePlatform { Upload, Twitch, Youtube, Kick, Other }
+public enum SourcePlatform { Upload, Twitch, Youtube, Kick, Other, Obs }
 
 public enum DetectedPlatform { Twitch, Youtube, Kick, Unknown }
 
@@ -57,3 +57,9 @@ public enum IntegrationProvider { Twitch, Youtube, ObsCompanion }
 public enum IntegrationStatus { Connected, Revoked, Error }
 
 public enum NotificationType { JobCompleted, JobFailed, ClipReady, QuotaWarning, Billing, System }
+
+/// <summary>waiting → live → ending → ended; error from any non-terminal state (docs/LIVE_CAPTURE.md §2).</summary>
+public enum LiveSessionStatus { Waiting, Live, Ending, Ended, Error }
+
+/// <summary>Mirrors the segment's live_segment job: received (stored) → queued → analyzing → analyzed | failed.</summary>
+public enum LiveSegmentStatus { Received, Queued, Analyzing, Analyzed, Failed }

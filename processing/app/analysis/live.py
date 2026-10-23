@@ -11,12 +11,15 @@ segment N itself. Every time the worker reports is an absolute session time.
   session-wide grid: the same moment lands on the same second in the two windows that see
   it, and the commit rule below decides it the same way in both.
 * **Commit rule.** ``postRoll = clamp(maxClipSeconds / 2, 8, 30)``; segment N reports the
-  candidates whose peak lies in ``[start_N - postRoll, end_N - postRoll)`` (segment 0 from
-  the start of the session, the final segment up to its end). The moments after
-  ``end_N - postRoll`` are left to segment N+1, which detects them again with segment N's
-  tail as context. A segment shorter than ``postRoll`` hands over at its own start instead
-  (``end - min(postRoll, duration)``): the next window's tail is that whole segment and
-  cannot see further back. The previous segment's hand-over point travels in the context
+  candidates whose peak lies between the previous segment's hand-over point and its own
+  (segment 0 from the start of the session, the final segment up to its end). The
+  hand-over point (:func:`handover_point`) is ``end_N - postRoll`` (``start_N`` for a
+  segment shorter than that): the moments after it are left to segment N+1, which detects
+  them again with segment N's tail as context. It never lies before the next window's
+  first whole second plus ``HANDOVER_CONTEXT`` (8 s: that window's first second can never
+  be a peak, and a moment rising there needs some context in the only window allowed to
+  report it), nor after ``end_N - 1`` (the last second of segment N's window cannot be a
+  peak either). The previous segment's hand-over point travels in the context
   (``committedUntil``) when the API passes it back, so the two sides of a boundary always
   use the very same number.
 * **Score.** The percentile of a peak is taken among the session's composite sample
@@ -50,6 +53,11 @@ SAMPLE_DIGITS = 3
 # the previous segment must end where the current one starts (session times) to be used as
 # its context; more than this apart (a gap or an overlap in the recording) it is not
 CONTIGUITY_TOLERANCE = 2.0
+# seconds of a segment the next window analyses before the hand-over point, at least (when
+# the segment is long enough): the next window's first second cannot be a peak, and a
+# moment that starts rising right after the window's origin would otherwise be decided
+# without its beginning (rolling baselines, smoothing, the clip's start)
+HANDOVER_CONTEXT = 8.0
 
 
 def post_roll_seconds(max_clip_seconds: float) -> float:
@@ -59,10 +67,23 @@ def post_roll_seconds(max_clip_seconds: float) -> float:
 
 
 def handover_point(start: float, duration: float, post_roll: float) -> float:
-    """Session time from which a segment leaves the peaks to the next one:
-    ``end - postRoll``, or the segment's own start when it is shorter than ``postRoll``."""
+    """Session time from which a segment leaves the peaks to the next one.
+
+    ``end - min(postRoll, duration)``: the moments after ``end - postRoll`` need media the
+    segment does not have yet. But the next window starts ``min(45 s, duration)`` before
+    the end, on a whole second (:func:`plan_window`), and its first second can never be a
+    peak: handing over at (or right after) that origin, as a segment shorter than about
+    ``postRoll`` + 2 s would, loses the moments of that second, and those rising there have
+    no context in the only window allowed to report them. So the hand-over point is never
+    before that origin + :data:`HANDOVER_CONTEXT`, nor, to keep it inside this segment's
+    window, after ``end - 1`` (the window's last second cannot be a peak either): a long
+    segment hands over at ``end - postRoll``, a 20 s one with ``postRoll`` 30 s at its
+    first whole second + 8 s, a 6 s one 1 s before its end."""
     duration = max(0.0, float(duration))
-    return round(float(start) + duration - min(float(post_roll), duration), 3)
+    end = float(start) + duration
+    rule = end - min(float(post_roll), duration)
+    next_origin = plan_window(end, duration).origin
+    return round(max(rule, min(end - 1.0, next_origin + HANDOVER_CONTEXT)), 3)
 
 
 @dataclass(slots=True)
@@ -92,15 +113,15 @@ def commit_range(
     previous_duration: float | None = None,
     committed_until: float | None = None,
 ) -> CommitRange:
-    """The commit rule: ``[start - postRoll, end - postRoll)``, from the start of the
-    session for segment 0 and up to the end for the final segment.
+    """The commit rule: from the previous segment's hand-over point to this one's
+    (:func:`handover_point`), from the start of the session for segment 0 and up to the end
+    for the final segment.
 
-    The lower bound is the previous segment's hand-over point: ``committed_until`` when the
-    previous segment's context carries it, else recomputed from its duration
-    (``start - min(postRoll, previous duration)``; ``start - postRoll`` when unknown). A
-    hand-over point always lies within ``postRoll`` (≤ 30 s) before the segment's start; a
-    ``committed_until`` elsewhere does not belong to this segment's predecessor and is
-    ignored."""
+    The lower bound is ``committed_until`` when the previous segment's context carries it,
+    else the previous segment's hand-over point recomputed from its duration
+    (``start - postRoll`` when unknown). A hand-over point always lies within ``postRoll``
+    (≤ 30 s) before the end of its segment; a ``committed_until`` elsewhere does not belong
+    to this segment's predecessor and is ignored."""
     if sequence <= 0:
         low = -math.inf
     elif committed_until is not None and (
@@ -109,9 +130,11 @@ def commit_range(
         <= float(start) + CONTIGUITY_TOLERANCE
     ):
         low = float(committed_until)
+    elif previous_duration is not None and previous_duration > 0:
+        previous = float(previous_duration)
+        low = handover_point(float(start) - previous, previous, post_roll)
     else:
-        previous = previous_duration if previous_duration and previous_duration > 0 else None
-        low = round(float(start) - min(float(post_roll), previous or float(post_roll)), 3)
+        low = round(float(start) - float(post_roll), 3)
     high = math.inf if final else handover_point(start, duration, post_roll)
     return CommitRange(low, high)
 
@@ -141,11 +164,12 @@ class WindowPlan:
 
     def scope(self, commit: CommitRange, *, starts_session: bool, ends_session: bool) -> PeakScope:
         """The commit range in the window's own seconds; an edge of the window is a real
-        edge only where the session itself starts (segment 0) or ends (final segment)."""
+        edge only where the session itself starts (segment 0, or a window whose tail reaches
+        back to the session's first second) or ends (final segment)."""
         return PeakScope(
             start=commit.start - self.origin,
             end=commit.end - self.origin,
-            left_edge=starts_session,
+            left_edge=starts_session or self.origin <= 0.0,
             right_edge=ends_session,
         )
 
