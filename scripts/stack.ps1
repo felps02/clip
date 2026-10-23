@@ -224,6 +224,32 @@ function Initialize-Database {
     Remove-Item Env:PGPASSWORD
 }
 
+# Variables the services read; copied into each detached launcher.
+$ServiceEnvNames = @(
+    "ASPNETCORE_ENVIRONMENT", "Kestrel__Endpoints__Http__Url", "ConnectionStrings__Default", "Storage__Local__RootPath",
+    "Api__PublicBaseUrl", "Api__WorkerBaseUrl", "Frontend__BaseUrl", "Cors__AllowedOrigins__0", "Cors__AllowedOrigins__1",
+    "Assistant__Provider", "Assistant__Local__BaseUrl", "CLIPFORGE_API_BASE_URL", "WORKER_ID", "WORK_DIR", "SERVICE_PORT",
+    "LLM_PROVIDER", "LLM_BASE_URL", "PORT", "HOSTNAME")
+
+function Start-Detached([string]$Exe, [string]$Arguments, [string]$WorkDir, [string]$Out, [string]$Err, [string]$Tag) {
+    # Start-Process children stay inside the caller's Windows job object, so they die with the
+    # terminal (or agent session) that started them. A process created through WMI belongs to the
+    # WMI host instead and keeps running after this script exits.
+    $launcher = Join-Path $Logs "launch-$Tag.cmd"
+    $lines = @("@echo off")
+    foreach ($name in $ServiceEnvNames + @(Get-ChildItem Env: | Where-Object { $_.Name -match "__" } | ForEach-Object { $_.Name })) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value) { $lines += "set `"$name=$value`"" }
+    }
+    $lines += "cd /d `"$WorkDir`""
+    $lines += "`"$Exe`" $Arguments > `"$Out`" 2> `"$Err`""
+    Set-Content -LiteralPath $launcher -Value ($lines | Select-Object -Unique) -Encoding ASCII
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = "cmd.exe /c `"$launcher`""; CurrentDirectory = $WorkDir; ProcessStartupInformation = $startup }
+    if ($result.ReturnValue -ne 0) { throw "could not start $Tag (Win32_Process.Create returned $($result.ReturnValue))" }
+}
+
 function Start-Stack {
     Publish-NewParts
     if (-not (Test-Path (Join-Path $Run "api\ClipForge.Api.dll"))) { throw "profile '$Name' is not packaged; run: .\scripts\stack.ps1 package -Name $Name" }
@@ -275,17 +301,17 @@ function Start-Stack {
             "llm" {
                 $threads = [Math]::Max(1, [Environment]::ProcessorCount)
                 $llmArgs = "-m `"$LlmModel`" --host 127.0.0.1 --port $LlmPort -c 8192 -np 2 -t $threads --jinja --no-webui"
-                Start-Process -FilePath $LlamaServer -ArgumentList $llmArgs -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err | Out-Null
+                Start-Detached -Exe $LlamaServer -Arguments $llmArgs -WorkDir (Split-Path $LlamaServer -Parent) -Out $out -Err $err -Tag "llm"
             }
             "api" {
-                Start-Process -FilePath "dotnet" -ArgumentList "ClipForge.Api.dll" -WorkingDirectory (Join-Path $Run "api") -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err | Out-Null
+                Start-Detached -Exe "dotnet" -Arguments "ClipForge.Api.dll" -WorkDir (Join-Path $Run "api") -Out $out -Err $err -Tag "$Name-api"
             }
             "worker" {
                 $python = Join-Path $Root "processing\.venv\Scripts\python.exe"
-                Start-Process -FilePath $python -ArgumentList "-m uvicorn app.main:app --host 127.0.0.1 --port $port" -WorkingDirectory (Join-Path $Run "processing") -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err | Out-Null
+                Start-Detached -Exe $python -Arguments "-m uvicorn app.main:app --host 127.0.0.1 --port $port" -WorkDir (Join-Path $Run "processing") -Out $out -Err $err -Tag "$Name-worker"
             }
             "web" {
-                Start-Process -FilePath "node" -ArgumentList "server.js" -WorkingDirectory (Join-Path $Run "web") -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err | Out-Null
+                Start-Detached -Exe "node" -Arguments "server.js" -WorkDir (Join-Path $Run "web") -Out $out -Err $err -Tag "$Name-web"
             }
         }
         $deadline = (Get-Date).AddSeconds(120)
