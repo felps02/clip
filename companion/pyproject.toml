@@ -1,0 +1,40 @@
+[project]
+name = "clipforge-companion"
+version = "0.1.0"
+description = "Local OBS companion: slices the creator's own OBS recording while it is written and uploads the segments for live highlight detection."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "httpx>=0.28,<0.29",
+    "websockets>=17,<18",
+]
+
+[project.scripts]
+clipforge-companion = "clipforge_companion.cli:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["clipforge_companion", "tests"]
+extend-exclude = [".venv", ".work"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "RUF001", # ambiguous unicode characters are expected in pt-BR copy
+    "RUF002",
+    "RUF003",
+    "SIM108", # ternaries are not always clearer
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["clipforge_companion", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs a real API (CLIPFORGE_API_URL / CLIPFORGE_DEVICE_TOKEN); excluded from the fast suite",
+    "ffmpeg: runs the real FFmpeg binary (skipped when it is not available)",
+]
+addopts = "-ra"
+tmp_path_retention_policy = "failed"

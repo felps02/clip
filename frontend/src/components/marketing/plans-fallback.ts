@@ -1,0 +1,105 @@
+import type { Plan } from "@/lib/api/types";
+
+/**
+ * Reference values: the default plan configuration shipped with the API
+ * (`backend/src/ClipForge.Api/appsettings.json` → `Plans`, documented in docs/PLANS_AND_BILLING.md).
+ * Shown only when `GET /api/plans` fails, always labelled as reference values, because the real
+ * limits and prices are configuration that each environment may override.
+ * Only the free plan carries its price (0, shown as "Grátis"); paid prices are deliberately absent.
+ * `plans-fallback.test.ts` keeps names, limits and features in sync with the API seed.
+ */
+export const FALLBACK_PLANS: Plan[] = [
+  {
+    code: "free",
+    name: "Gratuito",
+    description: "Para experimentar: 60 minutos de processamento por mês.",
+    priceMonthlyCents: 0,
+    currency: "BRL",
+    limits: {
+      monthlyProcessingMinutes: 60,
+      maxSourceDurationMinutes: 120,
+      maxFileSizeMb: 2048,
+      maxActiveProjects: 3,
+      maxCandidatesPerJob: 15,
+      maxAutoRenderPerJob: 15,
+      maxRendersPerMonth: 10,
+      maxRenderHeight: 720,
+      maxConcurrentJobs: 1,
+      priority: 0,
+      retentionDays: 7,
+      storageQuotaGb: 5,
+      transcriptionModel: "base",
+      allowWebcamLayout: false,
+      allowCustomSubtitleStyles: false,
+      assistantMessagesPerMonth: 100,
+    },
+    features: ["60 minutos de processamento por mês", "Até 3 projetos ativos", "Clipes em 720p", "Legendas automáticas"],
+  },
+  {
+    code: "creator",
+    name: "Creator",
+    description: "Para criadores que publicam toda semana.",
+    priceMonthlyCents: null,
+    currency: "BRL",
+    limits: {
+      monthlyProcessingMinutes: 600,
+      maxSourceDurationMinutes: 360,
+      maxFileSizeMb: 8192,
+      maxActiveProjects: 20,
+      maxCandidatesPerJob: 30,
+      maxAutoRenderPerJob: 30,
+      maxRendersPerMonth: 200,
+      maxRenderHeight: 1080,
+      maxConcurrentJobs: 2,
+      priority: 1,
+      retentionDays: 30,
+      storageQuotaGb: 50,
+      transcriptionModel: "small",
+      allowWebcamLayout: true,
+      allowCustomSubtitleStyles: true,
+      assistantMessagesPerMonth: 1000,
+    },
+    features: [
+      "600 minutos de processamento por mês",
+      "Até 20 projetos ativos",
+      "Clipes em 1080p",
+      "Layout com webcam",
+      "Estilos de legenda personalizados",
+      "Prioridade na fila",
+    ],
+  },
+  {
+    code: "pro",
+    name: "Pro",
+    description: "Para quem produz em volume.",
+    priceMonthlyCents: null,
+    currency: "BRL",
+    limits: {
+      monthlyProcessingMinutes: 2400,
+      maxSourceDurationMinutes: 720,
+      maxFileSizeMb: 20480,
+      maxActiveProjects: 0,
+      maxCandidatesPerJob: 50,
+      maxAutoRenderPerJob: 50,
+      maxRendersPerMonth: 0,
+      maxRenderHeight: 1080,
+      maxConcurrentJobs: 3,
+      priority: 2,
+      retentionDays: 90,
+      storageQuotaGb: 200,
+      transcriptionModel: "small",
+      allowWebcamLayout: true,
+      allowCustomSubtitleStyles: true,
+      assistantMessagesPerMonth: 5000,
+    },
+    features: [
+      "2400 minutos de processamento por mês",
+      "Projetos ilimitados",
+      "Renderizações ilimitadas",
+      "Clipes em 1080p",
+      "Layout com webcam",
+      "Máxima prioridade na fila",
+      "Retenção de 90 dias",
+    ],
+  },
+];

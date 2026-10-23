@@ -1,0 +1,9 @@
+# generated test fixtures (synthetic videos, TTS wav, render outputs) - never committed
+tests/fixtures/generated/
+# local work directory when WORK_DIR points inside the service folder
+work/
+models/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc

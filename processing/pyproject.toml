@@ -1,0 +1,40 @@
+[project]
+name = "clipforge-processing"
+version = "0.1.0"
+description = "ClipForge processing service: FastAPI health/dev endpoints plus the media job worker (FFmpeg, faster-whisper, OpenCV)."
+requires-python = ">=3.14"
+readme = "README.md"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+src = ["app", "tests"]
+extend-exclude = [".venv", "tests/fixtures/generated"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "RUF001", # ambiguous unicode characters are expected in pt-BR copy
+    "RUF002",
+    "RUF003",
+    "SIM108", # ternaries are not always clearer
+    "RUF012", # mutable class attributes are used deliberately for presets
+    "RUF046", # explicit int() around round()/ceil() documents intent with numpy scalars
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: tests that need the real API (or network) running; excluded from the fast suite",
+    "slow: CPU-heavy tests (still part of the fast suite, but longer)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:ctranslate2",
+    "ignore::DeprecationWarning:faster_whisper",
+]
+addopts = "-ra"

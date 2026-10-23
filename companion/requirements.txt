@@ -1,0 +1,5 @@
+# Runtime dependencies of the ClipForge OBS companion (pinned to the versions verified on the
+# development machine, Python 3.14). Install with:
+#   python -m pip install -r requirements.txt
+httpx==0.28.1
+websockets==17.3

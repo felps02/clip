@@ -1,0 +1,53 @@
+# --- secrets / local env ---
+.env
+.env.*
+!.env.example
+*.local.json
+appsettings.*.local.json
+
+# --- node / next ---
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.pnpm-store/
+coverage/
+playwright-report/
+test-results/
+
+# --- dotnet ---
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+*.trx
+
+# --- python ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- media / runtime data (never commit) ---
+.data/
+.tools/
+storage/
+tmp/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+!processing/tests/fixtures/*.wav
+models/
+
+# --- os / ide ---
+.DS_Store
+Thumbs.db
+.idea/
+*.log
