@@ -503,7 +503,7 @@ Companion endpoints (device token):
 | GET | `/companion/me` | – | `200 { device: { id, name }, user: { displayName }, plan: { code, name } }` |
 | POST | `/sessions` | `{ title?, segmentSeconds? (20–120, default 60), settings? (partial AnalysisSettings), obs?: { version?, recordingPath? } }` | `201 { session: LiveSession, settings }`; `400 validation_failed`; `409 plan_limit` when the device already has a `waiting`/`live`/`ending` session, or the plan's active-project / concurrent-job caps are reached |
 | POST | `/sessions/{id}/heartbeat` | `{ state: { obsConnected, streaming, recording, uploading, queueLength, lastError } }` | `200 { status, stopRequested, nextSequence }` (`nextSequence` = highest stored sequence + 1); `409 conflict` (`quota_exceeded` when the minutes ran out) once the session is `ended`/`error` |
-| POST | `/sessions/{id}/segments` | `multipart/form-data`: `sequence`, `startOffsetSeconds`, `durationSeconds`, `final?`, then `file` | `201 { segment: LiveSegment, duplicate: false }`; `200 { segment, duplicate: true }`; `400 validation_failed`; `409 conflict` (session terminal); `409 quota_exceeded`; `413 payload_too_large`; `422 invalid_media` |
+| POST | `/sessions/{id}/segments` | `multipart/form-data`: `sequence`, `startOffsetSeconds`, `durationSeconds`, `final?`, then `file` | `201 { segment: LiveSegment, duplicate: false }`; `200 { segment, duplicate: true }`; `400 validation_failed` (also more than 8 parts before `file`, malformed multipart); `409 conflict` (session terminal); `409 quota_exceeded` (minutes or storage); `413 payload_too_large`; `413 plan_limit` (over the plan's file size); `422 invalid_media`; `429 rate_limited` with `Retry-After` (backlog of the session full) |
 | POST | `/sessions/{id}/end` | `{ lastSequence? }` | `200 { session }` — `waiting`/`live` → `ending`, or straight to `ended` when no segment job is pending; repeating it (or calling it on a terminal session) returns the session unchanged |
 
 A session id of another user is `404` on every endpoint (the session is scoped to the token's
@@ -522,8 +522,9 @@ user, not to the device: a user's other device may end it).
   `recording: true`) → `ending` (`/end`; segments may still arrive and are analysed) → `ended`
   once every `live_segment` job of the session is terminal. `error` from `waiting`/`live`/
   `ending`: device revoked ("dispositivo revogado"), monthly minutes exhausted ("minutos de
-  processamento do mês esgotados"), companion silent ("companion offline", see below), project
-  deleted ("projeto excluído"). `endReason` (pt-BR) is also set when the companion ends the
+  processamento do mês esgotados"), storage quota exhausted ("cota de armazenamento do plano
+  esgotada"), companion silent ("companion offline", see below), project deleted ("projeto
+  excluído"). `endReason` (pt-BR) is also set when the companion ends the
   session ("encerrada pelo companion", or "encerrada pelo usuário na página Lives" after a stop).
   Pending segments of an `error` session are still analysed.
 - **Reaper.** Every `Live:ReaperIntervalSeconds` (30), a `waiting`/`live` session without a
@@ -531,11 +532,24 @@ user, not to the device: a user's other device may end it).
   offline"; an `ending` session whose segment jobs are all terminal goes to `ended`.
 - **Segment upload.** The text fields must come before `file` (the companion sends them first):
   `sequence` int 0–1 000 000, `startOffsetSeconds` ≥ 0, `durationSeconds` > 0 and ≤ 300
-  (stored with 3 decimals), `final` `true|false`. Idempotent per `(session, sequence)`: a stored
+  (stored with 3 decimals), `final` `true|false`. Only those four fields are read (1 KB each);
+  any other part is skipped without being read into memory, and more than 8 parts before `file`
+  is `400` (as is a malformed multipart body). Idempotent per `(session, sequence)`: a stored
   sequence answers `200 duplicate` with the stored segment, without storing anything (parallel
   retries of one sequence also end with one segment). Uploads are accepted while the session is
-  `waiting`, `live` or `ending`. When the plan's monthly minutes are exhausted (used + reserved ≥
-  limit) the session goes to `error` and the upload is `409 quota_exceeded`. The file must start
+  `waiting`, `live` or `ending`. **Quotas**, checked before a byte of the file is stored and
+  again with its real size under the per-user lock (a segment refused then is deleted from
+  storage): the monthly minutes — used + reserved by active jobs + the declared
+  `durationSeconds` of the user's segments not probed yet + this segment — and the plan's
+  storage quota (before the transfer: the request's `Content-Length`, or `Live:MaxSegmentMb`
+  without one) must hold it; otherwise
+  `409 quota_exceeded` and the session goes to `error`. A file over the plan's file size is
+  `413 plan_limit` (only that segment is refused). **Backlog:** when `Live:MaxQueuedSegments`
+  (5) segments of the session still wait for the worker (`received`/`queued`), a new segment is
+  `429 rate_limited` with `Retry-After: Live:QueueFullRetryAfterSeconds` (30), answered before
+  the file is read (the connection may be closed while the client is still sending; the
+  companion retries either way), so storage runs at most a few segments ahead of the worker.
+  The file must start
   with the Matroska/WebM (EBML `1A 45 DF A3`) or MP4 (`ftyp`) magic bytes (`422 invalid_media`
   otherwise) and is streamed to object storage as it arrives (never buffered whole), at most
   `Live:MaxSegmentMb` (512; `413 payload_too_large`, also when `Content-Length` already says
@@ -543,7 +557,8 @@ user, not to the device: a user's other device may end it).
   `users/{userId}/live/{sessionId}/seg_{sequence:00000}.{mkv|webm|mp4|mov}`), a `live_segments`
   row and one queued `processing_jobs` row (kind `live_segment`, input = the session's
   settings). Error answers are sent after the request body was read, so the companion gets the
-  problem instead of a reset connection.
+  problem instead of a reset connection (except `413`, too big to read, and `429`, retried
+  anyway).
 
 `Device`: `{ id, name, tokenPrefix, createdAt, lastSeenAt, revokedAt, online }` — `online` =
 not revoked and `lastSeenAt` within 60 s.

@@ -17,6 +17,8 @@ public class AppException : Exception
     public string Code { get; }
     public int Status { get; }
     public IDictionary<string, string[]>? Errors { get; }
+    /// <summary>When set, the problem answer carries <c>Retry-After</c> with this many seconds (e.g. a 429).</summary>
+    public int? RetryAfterSeconds { get; init; }
 
     public static AppException NotFound(string message = "Recurso não encontrado.") => new(ErrorCodes.NotFound, 404, message);
     public static AppException Forbidden(string message = "Acesso negado.") => new(ErrorCodes.Forbidden, 403, message);
@@ -26,6 +28,7 @@ public class AppException : Exception
     public static AppException PlanLimit(string message, int status = 409) => new(ErrorCodes.PlanLimit, status, message);
     public static AppException QuotaExceeded(string message) => new(ErrorCodes.QuotaExceeded, 409, message);
     public static AppException InvalidMedia(string message) => new(ErrorCodes.InvalidMedia, 422, message);
+    public static AppException RateLimited(string message, int retryAfterSeconds) => new(ErrorCodes.RateLimited, 429, message) { RetryAfterSeconds = retryAfterSeconds };
 }
 
 public static class ErrorCodes

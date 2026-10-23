@@ -9,8 +9,11 @@ using ClipForge.Api.Features.Live;
 using ClipForge.Api.Tests.Infrastructure;
 using ClipForge.Domain.Entities;
 using ClipForge.Domain.Enums;
+using ClipForge.Infrastructure.Storage;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace ClipForge.Api.Tests.Integration;
 
@@ -520,14 +523,15 @@ public class LiveCaptureTests : TestBase
         await ShouldBeProblemAsync(await Heartbeat(s.Device, sessionId, State(recording: true)), HttpStatusCode.Conflict, "quota_exceeded");
         (await WithDbAsync(db => db.LiveSegments.CountAsync())).ShouldBe(0);
 
-        // Not enough minutes for the segment: the worker's /probe refuses it and the session stops.
+        // The declared duration fits (60 s of the 60 left) but the file is longer: the worker's /probe refuses it and
+        // the session stops.
         var t = await SetupAsync();
         var otherId = (await CreateSessionAsync(t.Device)).GetProperty("id").GetGuid();
-        await UseProcessingSecondsAsync(t.UserId, 3570);
+        await UseProcessingSecondsAsync(t.UserId, 3540);
         await UploadOkAsync(t.Device, otherId, 0, 0, 60);
         var worker = CreateInternalClient(WorkerId);
         var payload = await ClaimLiveAsync(worker);
-        var probe = await worker.PostAsJsonAsync($"/internal/jobs/{payload.GetProperty("jobId").GetGuid()}/probe", ProbeOf(60), Json);
+        var probe = await worker.PostAsJsonAsync($"/internal/jobs/{payload.GetProperty("jobId").GetGuid()}/probe", ProbeOf(60.5), Json);
         await ShouldBeProblemAsync(probe, HttpStatusCode.Conflict, "quota_exceeded");
         var detail = await ReadJsonAsync(await t.User.GetAsync($"/api/live/sessions/{otherId}"));
         detail.GetProperty("session").GetProperty("status").GetString().ShouldBe("error");
@@ -605,7 +609,181 @@ public class LiveCaptureTests : TestBase
         (await s.Device.PostAsJsonAsync("/api/live/sessions", new { }, Json)).StatusCode.ShouldBe(HttpStatusCode.Created);
     }
 
+    // ---------------------------------------------------------------- quotas and backlog of segment uploads
+
+    [Fact]
+    public async Task Minutes_promised_to_segments_not_probed_yet_refuse_a_segment_that_could_never_be_analysed()
+    {
+        var s = await SetupAsync();
+        var sessionId = (await CreateSessionAsync(s.Device)).GetProperty("id").GetGuid();
+        await UseProcessingSecondsAsync(s.UserId, 3420); // 180 s left of the 3600 of the plan
+        await UploadOkAsync(s.Device, sessionId, 0, 0, 60);
+        await UploadOkAsync(s.Device, sessionId, 1, 60, 60);
+        // The worker probes segment 0: its minute is reserved now and must not be counted twice.
+        var worker = CreateInternalClient(WorkerId);
+        var payload = await ClaimLiveAsync(worker);
+        await ProbeAsync(worker, payload.GetProperty("jobId").GetGuid(), 60);
+        await UploadOkAsync(s.Device, sessionId, 2, 120, 60); // 3420 used + 60 reserved + 60 promised + 60 = 3600
+
+        var refused = await UploadSegmentAsync(s.Device, sessionId, 3, 180, 60);
+        await ShouldBeProblemAsync(refused, HttpStatusCode.Conflict, "quota_exceeded");
+        var session = (await ReadJsonAsync(await s.User.GetAsync($"/api/live/sessions/{sessionId}"))).GetProperty("session");
+        session.GetProperty("status").GetString().ShouldBe("error");
+        session.GetProperty("endReason").GetString().ShouldBe(LiveService.QuotaExhaustedReason);
+        (await WithDbAsync(db => db.LiveSegments.CountAsync(x => x.SessionId == sessionId))).ShouldBe(3);
+        File.Exists(SegmentPath(s.UserId, sessionId, 3)).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task A_segment_over_the_storage_quota_is_refused_before_it_is_stored_and_ends_the_session()
+    {
+        var s = await SetupAsync();
+        var sessionId = (await CreateSessionAsync(s.Device)).GetProperty("id").GetGuid();
+        await UploadOkAsync(s.Device, sessionId, 0, 0, 60);
+        // The free plan stores 5 GB; the user already has all of it but 1 KB.
+        await AddStoredBytesAsync(s.UserId, 5L * 1024 * 1024 * 1024 - 1024);
+
+        var refused = await UploadSegmentAsync(s.Device, sessionId, 1, 60, 60, FakeMkv(4096));
+        await ShouldBeProblemAsync(refused, HttpStatusCode.Conflict, "quota_exceeded");
+        var session = (await ReadJsonAsync(await s.User.GetAsync($"/api/live/sessions/{sessionId}"))).GetProperty("session");
+        session.GetProperty("status").GetString().ShouldBe("error");
+        session.GetProperty("endReason").GetString().ShouldBe(LiveService.StorageExhaustedReason);
+        File.Exists(SegmentPath(s.UserId, sessionId, 1)).ShouldBeFalse();
+        await WithDbAsync(async db =>
+        {
+            (await db.LiveSegments.CountAsync(x => x.SessionId == sessionId)).ShouldBe(1);
+            (await db.MediaAssets.CountAsync(a => a.UserId == s.UserId && a.Kind == MediaAssetKind.LiveSegment)).ShouldBe(1);
+        });
+        await ShouldBeProblemAsync(await Heartbeat(s.Device, sessionId, State(recording: true)), HttpStatusCode.Conflict, "quota_exceeded");
+        // The segment already stored is still analysed.
+        var worker = CreateInternalClient(WorkerId);
+        (await ClaimLiveAsync(worker)).GetProperty("live").GetProperty("sequence").GetInt32().ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task A_full_backlog_answers_429_with_retry_after_until_the_worker_takes_a_segment()
+    {
+        var s = await SetupAsync();
+        var sessionId = (await CreateSessionAsync(s.Device)).GetProperty("id").GetGuid();
+        for (var sequence = 0; sequence < 5; sequence++)
+        {
+            await UploadOkAsync(s.Device, sessionId, sequence, sequence * 60, 60);
+        }
+
+        var full = await UploadSegmentAsync(s.Device, sessionId, 5, 300, 60);
+        await ShouldBeProblemAsync(full, HttpStatusCode.TooManyRequests, "rate_limited");
+        full.Headers.RetryAfter.ShouldNotBeNull();
+        full.Headers.RetryAfter!.Delta.ShouldBe(TimeSpan.FromSeconds(30));
+        File.Exists(SegmentPath(s.UserId, sessionId, 5)).ShouldBeFalse();
+        var session = (await ReadJsonAsync(await s.User.GetAsync($"/api/live/sessions/{sessionId}"))).GetProperty("session");
+        session.GetProperty("status").GetString().ShouldBe("live");
+        session.GetProperty("stats").GetProperty("segmentsReceived").GetInt32().ShouldBe(5);
+        // A sequence already stored is still answered as a duplicate.
+        (await UploadSegmentAsync(s.Device, sessionId, 4, 240, 60)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // The worker takes segment 0: there is room for one more.
+        await ClaimLiveAsync(CreateInternalClient(WorkerId));
+        (await UploadSegmentAsync(s.Device, sessionId, 5, 300, 60)).StatusCode.ShouldBe(HttpStatusCode.Created);
+        await ShouldBeProblemAsync(await UploadSegmentAsync(s.Device, sessionId, 6, 360, 60), HttpStatusCode.TooManyRequests, "rate_limited");
+    }
+
+    [Fact]
+    public async Task Only_the_known_fields_are_read_and_too_many_parts_before_the_file_are_refused()
+    {
+        var s = await SetupAsync();
+        var sessionId = (await CreateSessionAsync(s.Device)).GetProperty("id").GetGuid();
+
+        // Other parts (even one over the 1 KB field limit, or another file) are skipped unread.
+        using var extra = SegmentForm(0, 0, 60);
+        extra.Add(new StringContent(new string('x', 5000)), "comment");
+        extra.Add(new ByteArrayContent(FakeMkv(100)), "thumbnail", "thumb.mkv");
+        extra.Add(new ByteArrayContent(FakeMkv(3000)), "file", "seg_00000.mkv");
+        var accepted = await s.Device.PostAsync($"/api/live/sessions/{sessionId}/segments", extra);
+        accepted.StatusCode.ShouldBe(HttpStatusCode.Created, await accepted.Content.ReadAsStringAsync());
+        File.ReadAllBytes(SegmentPath(s.UserId, sessionId, 0)).ShouldBe(FakeMkv(3000));
+
+        // A flood of tiny parts before the file: 400 after the 8th, nothing stored.
+        using var flood = new MultipartFormDataContent();
+        for (var i = 0; i < 50; i++) flood.Add(new StringContent("1"), $"f{i}");
+        AddSegmentFields(flood, 1, 60, 60);
+        flood.Add(new ByteArrayContent(FakeMkv()), "file", "seg_00001.mkv");
+        var refused = await s.Device.PostAsync($"/api/live/sessions/{sessionId}/segments", flood);
+        await ShouldBeProblemAsync(refused, HttpStatusCode.BadRequest, "validation_failed");
+        (await ReadJsonAsync(refused)).GetProperty("errors").GetProperty("file")[0].GetString()!.ShouldContain($"{LiveService.MaxPartsBeforeFile} campos");
+        (await WithDbAsync(db => db.LiveSegments.CountAsync(x => x.SessionId == sessionId))).ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task Segments_reach_s3_storage_although_the_request_stream_has_no_length()
+    {
+        // The API with S3 storage (the real SDK over an in-memory endpoint, 16 KB parts so a 50 KB segment goes up in parts).
+        var s3 = new FakeS3Handler();
+        await using var s3Api = Factory.WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+        {
+            services.RemoveAll<IObjectStorage>();
+            services.AddSingleton<IObjectStorage>(s3.CreateStorage(partSizeBytes: 16 * 1024));
+        }));
+        var user = s3Api.CreateClient(new() { AllowAutoRedirect = false, BaseAddress = new Uri("http://localhost") });
+        var register = await user.PostAsJsonAsync("/api/auth/register", new { email = NextEmail("s3"), password = "Password123", displayName = "S3", acceptedTerms = true }, Json);
+        register.StatusCode.ShouldBe(HttpStatusCode.Created, await register.Content.ReadAsStringAsync());
+        var userId = (await ReadJsonAsync(register)).GetProperty("user").GetProperty("id").GetGuid();
+        var (_, token) = await CreateDeviceAsync(user);
+        var device = s3Api.CreateClient(new() { AllowAutoRedirect = false, BaseAddress = new Uri("http://localhost") });
+        device.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        var sessionId = (await CreateSessionAsync(device)).GetProperty("id").GetGuid();
+
+        var small = FakeMkv(5000);
+        var large = FakeMkv(50_000);
+        await UploadOkAsync(device, sessionId, 0, 0, 60, bytes: small);
+        await UploadOkAsync(device, sessionId, 1, 60, 60, bytes: large);
+
+        var prefix = $"users/{userId:D}/live/{sessionId:D}/";
+        s3.Objects[prefix + "seg_00000.mkv"].Content.ShouldBe(small);
+        s3.Objects[prefix + "seg_00001.mkv"].Content.ShouldBe(large);
+        s3.Objects[prefix + "seg_00001.mkv"].ContentType.ShouldBe("video/x-matroska");
+        s3.Calls.ShouldContain($"PutObject {prefix}seg_00000.mkv");
+        s3.Calls.ShouldContain($"CompleteMultipartUpload {prefix}seg_00001.mkv 4");
+        s3.OpenUploads.ShouldBe(0);
+        var sizes = await WithDbAsync(db => db.MediaAssets.Where(a => a.UserId == userId && a.Kind == MediaAssetKind.LiveSegment)
+            .OrderBy(a => a.StorageKey).Select(a => a.SizeBytes).ToListAsync());
+        sizes.ShouldBe(new List<long> { 5000, 50_000 });
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    private string SegmentPath(Guid userId, Guid sessionId, int sequence)
+        => Path.Combine(Factory.StorageRoot, "users", userId.ToString("D"), "live", sessionId.ToString("D"), $"seg_{sequence:00000}.mkv");
+
+    /// <summary>A stored upload of <paramref name="bytes"/> (row only) counting against the storage quota of the user.</summary>
+    private async Task AddStoredBytesAsync(Guid userId, long bytes)
+    {
+        await WithDbAsync(async db =>
+        {
+            db.MediaAssets.Add(new MediaAsset
+            {
+                UserId = userId, Kind = MediaAssetKind.SourceUpload, StorageKey = $"users/{userId:D}/uploads/{Guid.NewGuid():N}.mp4",
+                OriginalFileName = "old.mp4", ContentType = "video/mp4", SizeBytes = bytes, Status = MediaAssetStatus.Uploaded,
+                UploadedAt = DateTimeOffset.UtcNow,
+            });
+            await db.SaveChangesAsync();
+        });
+    }
+
+    private static MultipartFormDataContent SegmentForm(int sequence, double start, double duration, bool final = false)
+    {
+        var form = new MultipartFormDataContent();
+        AddSegmentFields(form, sequence, start, duration, final);
+        return form;
+    }
+
+    private static void AddSegmentFields(MultipartFormDataContent form, int sequence, double start, double duration, bool final = false)
+    {
+        form.Add(new StringContent(sequence.ToString(CultureInfo.InvariantCulture)), "sequence");
+        form.Add(new StringContent(start.ToString("F6", CultureInfo.InvariantCulture)), "startOffsetSeconds");
+        form.Add(new StringContent(duration.ToString("F6", CultureInfo.InvariantCulture)), "durationSeconds");
+        form.Add(new StringContent(final ? "true" : "false"), "final");
+    }
+
 
     private sealed record LiveUser(HttpClient User, Guid UserId, HttpClient Device, Guid DeviceId, string Token);
 
@@ -671,9 +849,9 @@ public class LiveCaptureTests : TestBase
         return device.PostAsync($"/api/live/sessions/{sessionId}/segments", content);
     }
 
-    private static async Task<Guid> UploadOkAsync(HttpClient device, Guid sessionId, int sequence, double start, double duration, bool final = false)
+    private static async Task<Guid> UploadOkAsync(HttpClient device, Guid sessionId, int sequence, double start, double duration, bool final = false, byte[]? bytes = null)
     {
-        var response = await UploadSegmentAsync(device, sessionId, sequence, start, duration, final: final);
+        var response = await UploadSegmentAsync(device, sessionId, sequence, start, duration, bytes, final: final);
         response.StatusCode.ShouldBe(HttpStatusCode.Created, await response.Content.ReadAsStringAsync());
         return (await ReadJsonAsync(response)).GetProperty("segment").GetProperty("id").GetGuid();
     }

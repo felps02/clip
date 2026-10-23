@@ -70,10 +70,12 @@ public static class LiveEndpoints
                 var result = await service.UploadSegmentAsync(http.User.GetUserId(), id, http.Request, ct);
                 return result.Duplicate ? Results.Ok(result) : Results.Created($"/api/live/sessions/{id}/segments/{result.Segment.Sequence}", result);
             }
-            catch (AppException ex) when (ex.Status != StatusCodes.Status413PayloadTooLarge)
+            catch (AppException ex) when (ex.Status is not (StatusCodes.Status413PayloadTooLarge or StatusCodes.Status429TooManyRequests))
             {
                 // Answer only after the body was read: a client still sending the file would otherwise see a reset
-                // connection instead of the problem (and retry a request that can never succeed).
+                // connection instead of the problem (and retry a request that can never succeed). Not for 413 (the
+                // body is too big to read) nor for 429 (backlog full, decided before the file part): the companion
+                // retries that request anyway, so the file is not uploaded in vain each time.
                 await LiveService.DrainAsync(http.Request.Body, ct);
                 throw;
             }

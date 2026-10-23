@@ -37,12 +37,21 @@ public sealed class LiveService
     public const int DetailListLimit = 50;
     /// <summary>Room for the multipart fields and boundaries around the segment file.</summary>
     private const long MultipartOverheadBytes = 1024 * 1024;
+    /// <summary>Parts accepted before the file part of a segment upload (the four fields plus some slack); more is 400.</summary>
+    public const int MaxPartsBeforeFile = 8;
+
+    /// <summary>The only form fields of a segment upload that are read; any other part is skipped unread.</summary>
+    private static readonly HashSet<string> SegmentFieldNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "sequence", "startOffsetSeconds", "durationSeconds", "final",
+    };
 
     public static readonly TimeSpan DeviceOnlineWindow = TimeSpan.FromSeconds(60);
     public static readonly TimeSpan SessionOnlineWindow = TimeSpan.FromSeconds(30);
 
     // pt-BR reasons shown on the Lives page ("Motivo: …").
     public const string QuotaExhaustedReason = "minutos de processamento do mês esgotados";
+    public const string StorageExhaustedReason = "cota de armazenamento do plano esgotada";
     public const string DeviceRevokedReason = "dispositivo revogado";
     public const string CompanionOfflineReason = "companion offline";
     public const string ProjectDeletedReason = "projeto excluído";
@@ -268,9 +277,11 @@ public sealed class LiveService
 
     /// <summary>
     /// <c>multipart/form-data</c> with the fields <c>sequence</c>, <c>startOffsetSeconds</c>, <c>durationSeconds</c>,
-    /// <c>final</c> before the <c>file</c> part. The file is streamed to object storage (never buffered whole) after its
-    /// magic bytes were checked; idempotent per (session, sequence): a repeated sequence answers the stored segment with
-    /// <c>duplicate = true</c> and stores nothing.
+    /// <c>final</c> before the <c>file</c> part. Only those four fields are read (each at most 1 KB); any other part is
+    /// skipped without being buffered, and more than <see cref="MaxPartsBeforeFile"/> parts before the file is 400. The
+    /// plan quotas and the backlog of the session are checked before a byte of the file is stored (<see cref="CheckSegmentAsync"/>).
+    /// The file is streamed to object storage (never buffered whole) after its magic bytes were checked; idempotent per
+    /// (session, sequence): a repeated sequence answers the stored segment with <c>duplicate = true</c> and stores nothing.
     /// </summary>
     public async Task<SegmentUploadResponse> UploadSegmentAsync(Guid userId, Guid sessionId, HttpRequest request, CancellationToken ct)
     {
@@ -296,21 +307,28 @@ public sealed class LiveService
 
         var reader = new MultipartReader(boundary, request.Body);
         var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        while (await reader.ReadNextSectionAsync(ct) is { } section)
+        var partsBeforeFile = 0;
+        while (await NextSectionAsync(reader, ct) is { } section)
         {
-            if (!ContentDispositionHeaderValue.TryParse(section.ContentDisposition, out var disposition)) continue;
-            var name = HeaderUtilities.RemoveQuotes(disposition.Name).Value ?? string.Empty;
-            if (disposition.IsFileDisposition())
+            ContentDispositionHeaderValue.TryParse(section.ContentDisposition, out var disposition);
+            var name = disposition is null ? string.Empty : HeaderUtilities.RemoveQuotes(disposition.Name).Value ?? string.Empty;
+            if (disposition is not null && disposition.IsFileDisposition() && string.Equals(name, "file", StringComparison.OrdinalIgnoreCase))
             {
-                if (!string.Equals(name, "file", StringComparison.OrdinalIgnoreCase)) continue;
-                var result = await StoreSegmentAsync(userId, session, fields, section.Body, ct);
-                while (await reader.ReadNextSectionAsync(ct) is not null)
-                {
-                    // Parts after the file are ignored (drained by the reader).
-                }
+                var result = await StoreSegmentAsync(userId, session, fields, section.Body, request.ContentLength, ct);
+                // Parts after the file are ignored: what is left of the body is read and dropped.
+                await DrainAsync(request.Body, ct);
                 return result;
             }
-            if (disposition.IsFormDisposition() && name.Length > 0)
+            if (++partsBeforeFile > MaxPartsBeforeFile)
+            {
+                throw AppException.Validation("Dados inválidos.", new Dictionary<string, string[]>
+                {
+                    ["file"] = [$"Envie no máximo {MaxPartsBeforeFile} campos antes do arquivo do segmento."],
+                });
+            }
+            // A part that is not one of the known fields (another name, a file part not named "file", no
+            // disposition) is skipped: the reader drops its body when it moves to the next part.
+            if (disposition is not null && disposition.IsFormDisposition() && SegmentFieldNames.Contains(name))
             {
                 fields[name] = await ReadFieldAsync(name, section.Body, ct);
             }
@@ -318,7 +336,21 @@ public sealed class LiveService
         throw AppException.Validation("Dados inválidos.", new Dictionary<string, string[]> { ["file"] = ["Envie o arquivo do segmento no campo file."] });
     }
 
-    private async Task<SegmentUploadResponse> StoreSegmentAsync(Guid userId, LiveSession session, Dictionary<string, string> fields, Stream body, CancellationToken ct)
+    /// <summary>The next part; a malformed body (part headers over the limits of the reader, broken boundary) is 400, not 500.</summary>
+    private static async Task<MultipartSection?> NextSectionAsync(MultipartReader reader, CancellationToken ct)
+    {
+        try
+        {
+            return await reader.ReadNextSectionAsync(ct);
+        }
+        catch (InvalidDataException ex)
+        {
+            throw AppException.Validation("Corpo multipart inválido: " + ex.Message);
+        }
+    }
+
+    private async Task<SegmentUploadResponse> StoreSegmentAsync(Guid userId, LiveSession session, Dictionary<string, string> fields, Stream body,
+        long? declaredBytes, CancellationToken ct)
     {
         var (sequence, start, duration, final) = ParseSegmentFields(fields);
 
@@ -329,13 +361,16 @@ public sealed class LiveService
             return new SegmentUploadResponse(existing.ToDto(), true);
         }
 
-        // Monthly minutes: nothing left → the session stops (the worker's /probe reserves each segment's exact duration).
+        // Quotas before anything is stored, with the size the request declares (the segment limit when it is unknown).
         var usage = await _quotas.GetUsageAsync(userId, ct);
-        if (usage.RemainingProcessingSeconds <= 0)
+        if (await CheckSegmentAsync(session, usage, duration, declaredBytes ?? _options.MaxSegmentBytes, checkBacklog: true, ct) is { } early)
         {
-            await _jobs.SetSessionErrorAsync(session, QuotaExhaustedReason, ct);
-            await _db.SaveChangesAsync(ct);
-            throw QuotaExhausted();
+            if (early.SessionErrorReason is { } reason)
+            {
+                await _jobs.SetSessionErrorAsync(session, reason, ct);
+                await _db.SaveChangesAsync(ct);
+            }
+            throw early.Error;
         }
 
         var header = new byte[MediaMagic.HeaderLength];
@@ -361,18 +396,40 @@ public sealed class LiveService
             size = content.TotalBytes;
         }
 
+        SegmentRefusal? refusal = null;
+        SegmentUploadResponse? response;
         try
         {
-            return await _quotas.WithUserLockAsync(userId, async () =>
+            response = await _quotas.WithUserLockAsync(userId, async () =>
             {
-                var status = await _db.LiveSessions.Where(s => s.Id == session.Id).Select(s => s.Status).FirstAsync(ct);
-                if (status is LiveSessionStatus.Ended or LiveSessionStatus.Error)
+                // The same sequence stored by a parallel request (a retry while the first upload was still running):
+                // both wrote the same storage key, the first row wins.
+                var winner = await _db.LiveSegments.AsNoTracking().FirstOrDefaultAsync(s => s.SessionId == session.Id && s.Sequence == sequence, ct);
+                if (winner is not null) return new SegmentUploadResponse(winner.ToDto(), true);
+
+                var state = await _db.LiveSessions.AsNoTracking().Where(s => s.Id == session.Id)
+                    .Select(s => new { s.Status, s.EndReason }).FirstAsync(ct);
+                if (state.Status is LiveSessionStatus.Ended or LiveSessionStatus.Error)
                 {
-                    session.Status = status;
-                    throw TerminalConflict(session);
+                    refusal = new SegmentRefusal(TerminalConflict(state.Status, state.EndReason), null);
+                    return null;
                 }
+                // The quotas again with the real size, now that the uploads of this user are serialised (parallel
+                // uploads all passed the first check before any of them was stored).
+                var current = await _quotas.GetUsageAsync(userId, ct);
+                refusal = await CheckSegmentAsync(session, current, duration, size, checkBacklog: false, ct);
+                if (refusal is not null)
+                {
+                    if (refusal.SessionErrorReason is { } reason)
+                    {
+                        await _jobs.SetSessionErrorAsync(session, reason, ct);
+                        await _db.SaveChangesAsync(ct);
+                    }
+                    return null;
+                }
+
                 var now = _clock.UtcNow;
-                var entitlement = usage.Entitlement;
+                var entitlement = current.Entitlement;
                 var asset = new MediaAsset
                 {
                     UserId = userId,
@@ -433,12 +490,83 @@ public sealed class LiveService
         }
         catch (DbUpdateException ex) when (IsUniqueViolation(ex))
         {
-            // The same sequence was stored by a parallel request (a retry while the first upload was still running):
-            // both wrote the same storage key, the first row wins.
             _db.ChangeTracker.Clear();
             var winner = await _db.LiveSegments.AsNoTracking().FirstOrDefaultAsync(s => s.SessionId == session.Id && s.Sequence == sequence, ct);
             if (winner is not null) return new SegmentUploadResponse(winner.ToDto(), true);
             throw;
+        }
+
+        if (refusal is not null || response is null)
+        {
+            // Refused after the transfer: the file has no row and no other request stored this sequence, so it is
+            // deleted now instead of waiting for the purge of the project.
+            await DeleteQuietlyAsync(key);
+            throw refusal?.Error ?? AppException.Conflict("O segmento não foi aceito.");
+        }
+        return response;
+    }
+
+    /// <summary>Why a new segment is refused: the error to answer, and the reason the session goes to error with (if any).</summary>
+    private sealed record SegmentRefusal(AppException Error, string? SessionErrorReason);
+
+    /// <summary>
+    /// A new segment against the plan and the session (null = accepted):
+    /// <list type="bullet">
+    /// <item>monthly minutes: used + reserved by active jobs + the declared durations of the segments of the user whose
+    /// job has not reserved anything yet (not probed: the worker probes the segments of a session one at a time) + this
+    /// segment must fit the plan, otherwise 409 <c>quota_exceeded</c> and the session goes to error;</item>
+    /// <item>storage: the file size of the plan (413 <c>plan_limit</c>, only this segment is refused) and its storage
+    /// quota (409 <c>quota_exceeded</c>, the session goes to error);</item>
+    /// <item>backlog (<paramref name="checkBacklog"/>): <see cref="LiveOptions.MaxQueuedSegments"/> segments of the
+    /// session already waiting for the worker give 429 <c>rate_limited</c> with <c>Retry-After</c> (the companion keeps
+    /// the segment and retries), so storage only runs a few segments ahead of the worker.</item>
+    /// </list>
+    /// </summary>
+    private async Task<SegmentRefusal?> CheckSegmentAsync(LiveSession session, UsageSnapshot usage, decimal duration, long sizeBytes, bool checkBacklog, CancellationToken ct)
+    {
+        var limits = usage.Entitlement.Limits;
+        var unprobedSeconds = await _db.LiveSegments
+            .Where(s => s.UserId == session.UserId && _db.ProcessingJobs.Any(j => j.Id == s.JobId && j.ReservedSeconds == 0
+                && JobStateMachine.ActiveStatuses.Contains(j.Status)))
+            .SumAsync(s => (decimal?)s.DurationSeconds, ct) ?? 0m;
+        if (!QuotaCalculator.CheckProcessingSeconds(usage.ProcessingSecondsUsed, usage.ProcessingSecondsReserved + unprobedSeconds, duration, limits).Allowed)
+        {
+            return new SegmentRefusal(QuotaExhausted(), QuotaExhaustedReason);
+        }
+
+        var storage = QuotaCalculator.CheckUpload(Math.Max(1, sizeBytes), usage.StorageBytesUsed, limits);
+        if (!storage.Allowed)
+        {
+            return storage.Code == ErrorCodes.QuotaExceeded
+                ? new SegmentRefusal(StorageExhausted(), StorageExhaustedReason)
+                : new SegmentRefusal(new AppException(storage.Code!, storage.Status, storage.Message!), null);
+        }
+
+        if (checkBacklog)
+        {
+            var maxQueued = Math.Max(1, _options.MaxQueuedSegments);
+            var waiting = await _db.LiveSegments.CountAsync(s => s.SessionId == session.Id
+                && (s.Status == LiveSegmentStatus.Received || s.Status == LiveSegmentStatus.Queued), ct);
+            if (waiting >= maxQueued)
+            {
+                var retryAfter = Math.Max(1, _options.QueueFullRetryAfterSeconds);
+                return new SegmentRefusal(AppException.RateLimited(
+                    $"{waiting} segmentos desta sessão ainda aguardam análise: envie este de novo em {retryAfter} s (a fila anda conforme os segmentos são analisados).",
+                    retryAfter), null);
+            }
+        }
+        return null;
+    }
+
+    private async Task DeleteQuietlyAsync(string key)
+    {
+        try
+        {
+            await _storage.DeleteAsync(key, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not delete the refused live segment {Key}", key);
         }
     }
 
@@ -521,10 +649,15 @@ public sealed class LiveService
     private static AppException QuotaExhausted()
         => AppException.QuotaExceeded("Os minutos de processamento do mês acabaram: a sessão ao vivo foi encerrada. Faça upgrade do plano para continuar.");
 
-    private static AppException TerminalConflict(LiveSession session)
-        => session.Status == LiveSessionStatus.Error && session.EndReason == QuotaExhaustedReason
-            ? QuotaExhausted()
-            : AppException.Conflict(session.EndReason is { Length: > 0 } reason
+    private static AppException StorageExhausted()
+        => AppException.QuotaExceeded("A cota de armazenamento do plano acabou: a sessão ao vivo foi encerrada. Exclua projetos antigos ou faça upgrade do plano para continuar.");
+
+    private static AppException TerminalConflict(LiveSession session) => TerminalConflict(session.Status, session.EndReason);
+
+    private static AppException TerminalConflict(LiveSessionStatus status, string? endReason)
+        => status == LiveSessionStatus.Error && endReason == QuotaExhaustedReason ? QuotaExhausted()
+            : status == LiveSessionStatus.Error && endReason == StorageExhaustedReason ? StorageExhausted()
+            : AppException.Conflict(endReason is { Length: > 0 } reason
                 ? $"A sessão já foi encerrada ({reason})."
                 : "A sessão já foi encerrada.");
 

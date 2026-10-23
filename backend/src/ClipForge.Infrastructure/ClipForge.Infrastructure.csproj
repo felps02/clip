@@ -25,4 +25,8 @@
     <PackageReference Include="System.Security.Cryptography.Pkcs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="ClipForge.Api.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using ClipForge.Domain.Common;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
@@ -66,7 +67,8 @@ public sealed class GlobalExceptionHandler : IExceptionHandler
             case AppException app:
                 if (app.Status == StatusCodes.Status503ServiceUnavailable) _logger.LogWarning("Service unavailable {Code}: {Message}", app.Code, app.Message);
                 else if (app.Status >= 500) _logger.LogError(app, "Application error {Code}", app.Code);
-                await Problems.WriteAsync(context, app.Status, app.Code, app.Message, app.Errors);
+                await Problems.WriteAsync(context, app.Status, app.Code, app.Message, app.Errors,
+                    app.RetryAfterSeconds is { } retryAfter ? headers => headers.RetryAfter = retryAfter.ToString(CultureInfo.InvariantCulture) : null);
                 return true;
 
             case FluentValidation.ValidationException validation:

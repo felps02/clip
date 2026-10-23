@@ -204,7 +204,7 @@ stats: { segmentsReceived, segmentsAnalyzed, segmentsFailed, highlights, recorde
 `online` = heartbeat within 30 s. `status`: `waiting` (created, nothing received) → `live`
 (first segment or heartbeat with `recording: true`) → `ending` (end called; segments still
 being analysed) → `ended`; `error` from any non-terminal state (device revoked, quota
-exhausted, companion offline for `Live:SessionTimeoutMinutes`, default 10).
+exhausted (minutes or storage), companion offline for `Live:SessionTimeoutMinutes`, default 10).
 
 `LiveSessionDetail`: `{ session: LiveSession, settings: AnalysisSettings, segments:
 LiveSegment[] (latest 50, newest first), highlights: ClipSummary[] (clips of the session's
@@ -220,7 +220,7 @@ project, newest first, max 50), candidateCount }`.
 | GET | `/api/live/companion/me` | – | `200 { device: { id, name }, user: { displayName }, plan: { code, name } }` |
 | POST | `/api/live/sessions` | `{ title?, segmentSeconds? (20–120, default 60), settings? (partial AnalysisSettings), obs?: { version?, recordingPath? } }` | `201 { session: LiveSession, settings }`; `409 plan_limit` when the device already has a non-terminal session or the plan's active project / concurrency limits are reached |
 | POST | `/api/live/sessions/{id}/heartbeat` | `{ state: companionState }` | `200 { status, stopRequested, nextSequence }`; `409 conflict` when the session is terminal |
-| POST | `/api/live/sessions/{id}/segments` | `multipart/form-data`: `sequence` (int ≥ 0), `startOffsetSeconds` (≥ 0), `durationSeconds` (> 0, ≤ 300), `final` (bool, optional), `file` (≤ `Live:MaxSegmentMb`, default 512; Matroska/WebM or MP4 by magic bytes) | `201 { segment, duplicate: false }`; `200 { segment, duplicate: true }` when `(session, sequence)` already exists; `409` session terminal; `413` too big; `422 invalid_media`; `409 quota_exceeded` (monthly minutes exhausted: the session goes to `error`) |
+| POST | `/api/live/sessions/{id}/segments` | `multipart/form-data`: `sequence` (int ≥ 0), `startOffsetSeconds` (≥ 0), `durationSeconds` (> 0, ≤ 300), `final` (bool, optional), then `file` (≤ `Live:MaxSegmentMb`, default 512; Matroska/WebM or MP4 by magic bytes). Other parts are skipped unread; at most 8 parts before `file` | `201 { segment, duplicate: false }`; `200 { segment, duplicate: true }` when `(session, sequence)` already exists; `400` (more than 8 parts before `file`, malformed multipart); `409` session terminal; `413` too big (`413 plan_limit` over the plan's file size); `422 invalid_media`; `409 quota_exceeded` (monthly minutes or storage quota exhausted, see below: the session goes to `error`); `429 rate_limited` + `Retry-After` (backlog full, see below) |
 | POST | `/api/live/sessions/{id}/end` | `{ lastSequence? }` | `200 { session }` → `ending`, then `ended` once every segment job is terminal |
 
 A session is always scoped to the device's user; another user's session id → `404`.
@@ -236,6 +236,25 @@ a `live_segment` job is only claimable when every lower-sequence job of the same
 terminal, so the context of segment N is available to segment N+1 (after a failed segment, the
 newest earlier `liveContext` is passed). Quota: the worker's
 `/probe` reserves the segment duration exactly like an uploaded source.
+
+**Quotas and backlog at upload.** Checked once the fields are read, before a byte of the file
+is stored, and again with the real size under the per-user lock before the segment is recorded
+(a segment refused then is deleted from storage):
+- monthly minutes: used + reserved by active jobs + the declared `durationSeconds` of the
+  user's segments whose job has not been probed yet + this segment must fit the plan;
+- storage: the plan's storage quota must hold the file (its size; before the transfer the
+  request's `Content-Length`, or `Live:MaxSegmentMb` without one); a file over the plan's file
+  size is `413 plan_limit` (only that segment is refused).
+
+Otherwise `409 quota_exceeded` and the session goes to `error` ("minutos de processamento do
+mês esgotados" / "cota de armazenamento do plano esgotada"); the segments already stored are
+still analysed. **Backlog:** when `Live:MaxQueuedSegments` (default 5) segments of the session
+are still waiting for the worker (`received`/`queued`), a new one is `429 rate_limited` with
+`Retry-After: Live:QueueFullRetryAfterSeconds` (default 30). That answer comes before the file
+is read (the API may close the connection while the companion is still sending it; the
+companion retries either way), so storage runs at most a few segments ahead of the worker
+when the companion uploads faster than real time (file mode on a finished recording, a queue
+sent after an outage).
 
 ## 3. Worker: `live_segment` jobs
 

@@ -178,6 +178,14 @@ public sealed class LiveOptions
     public int MaxSegmentMb { get; set; } = 512;
     /// <summary>How often the reaper looks for silent sessions and finished "ending" sessions.</summary>
     public int ReaperIntervalSeconds { get; set; } = 30;
+    /// <summary>
+    /// Segments of one session stored and still waiting for the worker (received/queued) before a new one is refused
+    /// with 429 + <c>Retry-After</c> (the companion keeps it and retries), so storage only runs a few segments ahead of
+    /// the worker when the companion uploads faster than real time.
+    /// </summary>
+    public int MaxQueuedSegments { get; set; } = 5;
+    /// <summary><c>Retry-After</c> (seconds) of that 429.</summary>
+    public int QueueFullRetryAfterSeconds { get; set; } = 30;
 
     public long MaxSegmentBytes => Math.Max(1, MaxSegmentMb) * 1024L * 1024L;
 }

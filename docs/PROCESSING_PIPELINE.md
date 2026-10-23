@@ -593,7 +593,9 @@ handover_N = max(end_N − min(postRoll, duration_N), min(end_N − 1, origin_{N
   reported by nobody: every boundary of 20 s or 30 s segments with `postRoll` 30 lost the
   moment of its first second, and the e2e fixture cut every ~21 s lost its moment at
   45.5 s (tested, the latter through the worker). 20 s segments with `postRoll` 30 hand
-  over at `ceil(start) + 8`;
+  over at `ceil(start) + 8`. A moment a segment keeps this way has less than `postRoll`
+  of media after it: its clip ends, at the latest, where the segment ends (moved earlier
+  rather than shortened, as at the end of any window);
 - **never after `end_N − 1`**: the last second of segment N's window is never a peak
   either (a 6 s segment with `postRoll` 10 hands over 1 s before its end; a segment shorter
   than 1 s at its own start);
